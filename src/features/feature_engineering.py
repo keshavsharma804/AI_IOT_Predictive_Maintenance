@@ -46,9 +46,9 @@ class FeatureEngineer(LoggerMixin):
         window_size: int = 1000,
         stride: int = 500,
         sensor_cols: List[str] = None,
-        include_rolling: bool = True,
-        include_frequency: bool = True,
-        include_temporal: bool = True,
+        include_rolling: bool = false,
+        include_frequency: bool = false,
+        include_temporal: bool = false,
         bearing_params: Optional[Dict] = None
     ) -> pd.DataFrame:
         """
