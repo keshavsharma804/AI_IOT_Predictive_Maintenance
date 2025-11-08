@@ -1,0 +1,161 @@
+# Configuration for IoT Predictive Maintenance System
+
+project:
+  name: "Industrial IoT Predictive Maintenance"
+  version: "1.0.0"
+  author: "Your Name"
+
+# Data Generation Configuration
+data_generation:
+  sampling_rate: 20  # Hz (100 samples per second)
+  duration_days: 1  # Generate 30 days of data
+  num_machines: 1  # Number of machines to simulate
+  
+  sensors:
+    vibration:
+      channels: 3  # X, Y, Z axes
+      normal_range: [0.5, 2.0]  # mm/s RMS
+      failure_threshold: 10.0
+      noise_level: 0.1
+    
+    temperature:
+      normal_range: [40, 60]  # Celsius
+      failure_threshold: 95
+      noise_level: 0.5
+    
+    pressure:
+      normal_range: [80, 120]  # PSI
+      failure_threshold: 150
+      noise_level: 1.0
+    
+    current:
+      normal_range: [8, 12]  # Amps
+      failure_threshold: 18
+      noise_level: 0.2
+  
+  # Failure scenarios
+  failures:
+    bearing_wear:
+      probability: 0.05  # 5% chance
+      degradation_days: 7  # Takes 7 days to fail
+      affected_sensors: ['vibration', 'temperature']
+    
+    imbalance:
+      probability: 0.03
+      degradation_days: 3
+      affected_sensors: ['vibration']
+    
+    cavitation:
+      probability: 0.04
+      degradation_days: 5
+      affected_sensors: ['vibration', 'pressure']
+    
+    overheating:
+      probability: 0.03
+      degradation_days: 2
+      affected_sensors: ['temperature', 'current']
+
+# Feature Engineering
+features:
+  time_domain:
+    - rms
+    - peak_to_peak
+    - crest_factor
+    - kurtosis
+    - skewness
+    - zero_crossing_rate
+    - mean_absolute_deviation
+  
+  frequency_domain:
+    - fft_coefficients
+    - power_spectral_density
+    - dominant_frequency
+    - spectral_centroid
+    - band_power
+  
+  temporal:
+    rolling_windows: [5, 30, 300]  # seconds
+    lag_periods: [1, 5, 10, 60]  # minutes
+
+# Model Configuration
+models:
+  isolation_forest:
+    n_estimators: 200
+    contamination: 0.02  # Expected 2% anomalies
+    max_samples: 256
+    random_state: 42
+  
+  lstm_autoencoder:
+    sequence_length: 100
+    encoding_dim: 32
+    epochs: 50
+    batch_size: 32
+    learning_rate: 0.001
+  
+  prophet:
+    changepoint_prior_scale: 0.05
+    seasonality_prior_scale: 10.0
+    daily_seasonality: True
+    weekly_seasonality: True
+  
+  ensemble:
+    voting_method: "weighted"
+    weights:
+      isolation_forest: 0.4
+      lstm_autoencoder: 0.35
+      prophet: 0.25
+
+# Evaluation
+evaluation:
+  test_size: 0.2
+  validation_size: 0.1
+  time_series_cv_splits: 5
+  
+  metrics:
+    - precision
+    - recall
+    - f1_score
+    - roc_auc
+    - average_precision
+    - confusion_matrix
+  
+  thresholds:
+    precision_target: 0.92
+    recall_target: 0.88
+    false_alarm_rate_max: 0.05
+
+# Business Metrics
+business:
+  cost_unplanned_downtime: 5000  # USD per hour
+  cost_planned_maintenance: 500  # USD per event
+  cost_false_alarm: 100  # USD per false alarm
+  equipment_replacement_cost: 50000  # USD
+  
+# Visualization
+visualization:
+  dashboard_refresh_rate: 1  # seconds
+  plot_style: "seaborn-v0_8-darkgrid"
+  figure_dpi: 300
+  colors:
+    normal: "#2ECC71"
+    warning: "#F39C12"
+    critical: "#E74C3C"
+    anomaly: "#C0392B"
+
+# Paths
+paths:
+  data_raw: "data/raw"
+  data_processed: "data/processed"
+  data_features: "data/features"
+  data_synthetic: "data/synthetic"
+  models: "models/saved_models"
+  results: "results"
+  figures: "results/figures"
+  reports: "results/reports"
+  logs: "logs"
+
+# Logging
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/system.log"
