@@ -84,9 +84,9 @@ def main():
                 df,
                 window_size=args.window_size,
                 stride=args.stride,
-                include_rolling=True,
-                include_frequency=True,
-                include_temporal=True,
+                include_rolling=False,
+                include_frequency=False,
+                include_temporal=False,
                 bearing_params=bearing_params
             )
             
