@@ -276,32 +276,24 @@ Detects **early faults** in rotating machinery from vibration signals.
 # LIVE tab: Simulated Stream (A2) and MQTT
 # ────────────────────────────────────────────────────────────────────────────────
 with tab_live:
-    st.subheader("🟢 Live Monitoring")
+    st.subheader("🟢 Live Monitoring (Real-Time)")
 
-    mode = st.radio("Live mode", ["Simulated Stream (A2)", "MQTT Live"], horizontal=True)
+    mode = st.radio("Select Live Mode:", ["Simulated Stream (A2)", "MQTT Live"], horizontal=True)
 
-    # Common live chart setup
     live_placeholder = st.empty()
     stats_placeholder = st.empty()
 
+    # Append sample & update UI
     def push_sample_xyz(x, y, z):
-        rms = float(math.sqrt((x*x + y*y + z*z)/3.0))
+        rms = float(math.sqrt((x*x + y*y + z*z) / 3.0))
         st.session_state.live_buffer.append(rms)
-        # keep chart snappy by limiting points
-        buf = np.array(st.session_state.live_buffer)[-max_points:]
-        df_view = pd.DataFrame({"vibration_rms": buf})
-        live_placeholder.line_chart(df_view)
 
-        # Score in mini-batches for speed
-        if len(buf) >= 200:
-            tmp_df = pd.DataFrame({"vibration_rms": buf})
-            out = score_offline(model, tmp_df)
-            faults = int((out["decisions"] == 1).sum())
-            stats_placeholder.metric("Live Fault Windows (buffer)", faults)
-
+    # ─────────────────────────────────────────────────────────────────────
+    # Mode A2 — Simulated Real-Time Streaming from Demo Data
+    # ─────────────────────────────────────────────────────────────────────
     if mode == "Simulated Stream (A2)":
-        st.write("Reads demo data and streams it live.")
-        sim_rate = st.slider("Samples per update", 1, 50, 10, 1)
+        st.write("📡 Streaming artificial live data from demo vibration dataset")
+        sim_rate = st.slider("Samples per frame", 1, 50, 10)
 
         cols = st.columns(3)
         if cols[0].button("▶️ Start"):
@@ -313,28 +305,38 @@ with tab_live:
             st.session_state.live_buffer.clear()
 
         demo = load_demo_dataframe()
-        # if demo has axes, use them; else synthesize x,y,z from rms
+
         if {"x","y","z"}.issubset(demo.columns):
             xs, ys, zs = demo["x"].values, demo["y"].values, demo["z"].values
         else:
             rms = demo["vibration_rms"].values
-            # fake x,y,z around rms (for visualization only)
             xs, ys, zs = rms*0.95, rms*1.02, rms*1.03
 
-        i = 0
-        # Single pass loop per rerun, keeps UI responsive
         if st.session_state.live_running:
-            end = min(i + sim_rate, len(xs))
-            for k in range(sim_rate):
-                idx = (i + k) % len(xs)
-                push_sample_xyz(float(xs[idx]), float(ys[idx]), float(zs[idx]))
-            time.sleep(update_interval / 1000.0)
+            for _ in range(sim_rate):
+                idx = np.random.randint(0, len(xs))
+                push_sample_xyz(xs[idx], ys[idx], zs[idx])
 
-    else:
-        st.write("Connects to a public MQTT broker (`broker.hivemq.com`).")
-        st.caption("Topic: `machine/vibration/data` • Expected JSON: `{ \"x\":0.54, \"y\":0.49, \"z\":0.61 }`")
+        recent = list(st.session_state.live_buffer)[-max_points:]
+        if len(recent):
+            live_placeholder.line_chart(pd.DataFrame({"vibration_rms": recent}))
+
+            if len(recent) > 200:
+                out_live = score_offline(model, pd.DataFrame({"vibration_rms": recent}))
+                stats_placeholder.metric("Detected Fault Windows", int((out_live["decisions"] == 1).sum()))
+
+        time.sleep(update_interval / 1000.0)
+        st.experimental_rerun()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Mode B — REAL MQTT LIVE DATA
+    # ─────────────────────────────────────────────────────────────────────
+    if mode == "MQTT Live":
+        st.write("🌍 Connecting to Public MQTT Broker")
+        st.caption("Topic: `machine/vibration/data`  |  Format: `{ \"x\":0.54, \"y\":0.49, \"z\":0.61 }`")
+
         if not MQTT_OK:
-            st.error("`paho-mqtt` not installed. Add `paho-mqtt` to requirements.txt.")
+            st.error("Install MQTT first:  pip install paho-mqtt")
         else:
             broker = "broker.hivemq.com"
             topic = "machine/vibration/data"
@@ -342,47 +344,60 @@ with tab_live:
             def on_connect(client, userdata, flags, rc, properties=None):
                 if rc == 0:
                     st.session_state.mqtt_connected = True
-                    client.subscribe(topic, qos=0)
+                    client.subscribe(topic)
                 else:
-                    st.session_state.mqtt_last_err = f"Connect failed (rc={rc})"
+                    st.session_state.mqtt_last_err = f"MQTT failed (rc={rc})"
 
             def on_message(client, userdata, msg):
                 try:
-                    payload = json.loads(msg.payload.decode("utf-8"))
-                    x = float(payload.get("x"))
-                    y = float(payload.get("y"))
-                    z = float(payload.get("z"))
-                    push_sample_xyz(x, y, z)
-                except Exception as e:
-                    st.session_state.mqtt_last_err = f"Bad payload: {e}"
+                    j = json.loads(msg.payload.decode("utf-8"))
+                    push_sample_xyz(float(j.get("x",0)), float(j.get("y",0)), float(j.get("z",0)))
+                except:
+                    pass
 
-            cols = st.columns(3)
-            if cols[0].button("🔌 Connect"):
+            colA, colB, colC = st.columns(3)
+
+            if colA.button("🔌 Connect"):
                 try:
                     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets")
+                    client.ws_set_options(path="/mqtt")
                     client.on_connect = on_connect
                     client.on_message = on_message
-                    # Non-blocking loop
-                    client.connect(broker, 1883, 60)
+                    client.connect(broker, 8000, 60)
                     client.loop_start()
                     st.session_state.mqtt_client = client
                 except Exception as e:
-                    st.error(f"MQTT connect error: {e}")
+                    st.error(f"MQTT Error: {e}")
 
-            if cols[1].button("🔕 Disconnect"):
-                c = st.session_state.get("mqtt_client")
-                if c:
-                    c.loop_stop()
-                    c.disconnect()
+            if colB.button("🔕 Disconnect"):
+                if "mqtt_client" in st.session_state:
+                    st.session_state.mqtt_client.loop_stop()
+                    st.session_state.mqtt_client.disconnect()
                 st.session_state.mqtt_connected = False
 
-            if cols[2].button("🧹 Clear Buffer"):
+            if colC.button("🧹 Clear Data"):
                 st.session_state.live_buffer.clear()
 
             if st.session_state.mqtt_connected:
-                st.success("Connected to MQTT broker.")
+                st.success("✅ Receiving real sensor data...")
             if st.session_state.mqtt_last_err:
                 st.warning(st.session_state.mqtt_last_err)
+
+        # UI update loop
+        recent = list(st.session_state.live_buffer)[-max_points:]
+        if len(recent):
+            live_placeholder.line_chart(pd.DataFrame({"vibration_rms": recent}))
+
+            if len(recent) > 200:
+                out_live = score_offline(model, pd.DataFrame({"vibration_rms": recent}))
+                stats_placeholder.metric("Live Fault Windows", int((out_live["decisions"] == 1).sum()))
+
+        if not st.session_state.mqtt_connected:
+            st.stop()
+
+        time.sleep(update_interval / 1000)
+        st.experimental_rerun()
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Admin: Asset table & thresholds
