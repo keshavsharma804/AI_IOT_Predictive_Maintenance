@@ -54,54 +54,58 @@ class HybridEnsemble:
         return out[..., None]  # (N, seq_len, 1)
 
     # -------- Fit models --------
-     def fit(self, features_df: pd.DataFrame, raw_df: pd.DataFrame, signal_col: str = "vibration_rms"):
-
-        # ---- CLEAN FEATURE DATA ----
-        drop_cols = [
+         def fit(self, features_df: pd.DataFrame, raw_df: pd.DataFrame, signal_col: str = "vibration_rms"):
+        # --------- PREPARE FEATURES FOR ISOLATION FOREST ---------
+        # Drop non-numeric / metadata columns
+        features_df = features_df.drop(columns=[
             c for c in features_df.columns
-            if any(x in c.lower() for x in [
-                "timestamp", "window", "machine", "failure", "severity", "label", "id", "start", "end"
-            ])
-        ]
-        features_df = features_df.drop(columns=drop_cols, errors='ignore')
-    
-        # Keep only numeric columns
-        features_df = features_df.select_dtypes(include=['float32','float64','int32','int64'])
-    
+            if any(x in c.lower() for x in
+                   ["timestamp", "window", "machine", "failure", "severity", "label"])
+        ], errors='ignore')
+
+        # Select numeric features only
+        features_df = features_df.select_dtypes(include=['float32', 'float64', 'int32', 'int64'])
+
         if features_df.shape[1] == 0:
-            raise ValueError("No numeric features remain after cleaning. Feature extraction may have failed.")
-    
-        # ---- TRAIN ISOLATION FOREST ----
-        X = features_df.values
-        Xs = self.scaler.fit_transform(X)
+            raise ValueError("No numeric features available for IF model!")
+
+        # Scale and train Isolation Forest
+        Xs = self.scaler.fit_transform(features_df)
         self.if_model.fit(Xs)
-    
+
+        # Compute anomaly threshold
         if_scores = -self.if_model.decision_function(Xs)
-        self.if_score_threshold = float(np.percentile(if_scores, 95.0))
-    
-        # ---- PREPARE RAW SIGNAL FOR LSTM ----
+        self.if_score_threshold = float(np.percentile(if_scores, 95))
+
+        # --------- PREPARE RAW SIGNAL FOR LSTM AUTOENCODER ---------
         if signal_col not in raw_df.columns:
-            raise ValueError(f"Signal column '{signal_col}' not found in raw data")
-    
+            raise ValueError(f"Signal column '{signal_col}' not found!")
+
         signal = raw_df[signal_col].astype(float).values
         seqs = self._make_sequences(signal, self.seq_len)
-    
+
         if len(seqs) == 0:
-            raise ValueError("Not enough raw samples to form sequences. Reduce --seq-len")
-    
-        # Build and train LSTM autoencoder
+            raise ValueError("Not enough samples for forming LSTM sequences. Reduce seq_len.")
+
+        # Build LSTM Autoencoder
         self.lstm = self._build_lstm_autoencoder(self.seq_len)
-        self.lstm.fit(seqs, seqs,
-                      epochs=self.lstm_epochs,
-                      batch_size=self.lstm_batch,
-                      verbose=1)
-    
-        # Reconstruction threshold
-        recon = self.lstm.predict(seqs)
-        errors = np.mean(np.abs(recon - seqs), axis=(1,2))
-        self.recon_threshold = float(np.percentile(errors, 95.0))
-    
-        print("✅ Hybrid Model Training Complete")
+
+        # Train LSTM Autoencoder
+        self.lstm.fit(
+            seqs, seqs,
+            epochs=self.lstm_epochs,
+            batch_size=self.lstm_batch,
+            validation_split=0.1,
+            verbose=1
+        )
+
+        # Compute reconstruction error threshold
+        preds = self.lstm.predict(seqs, verbose=0)
+        errors = np.mean(np.abs(preds - seqs), axis=(1, 2))
+        self.recon_threshold = float(np.percentile(errors, 95))
+
+        print("✅ Hybrid Model Training Completed")
+
 
 
 
