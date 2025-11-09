@@ -282,8 +282,9 @@ with tab_live:
 
     live_placeholder = st.empty()
     stats_placeholder = st.empty()
+    debug_placeholder = st.empty()
 
-    # Append sample & update UI
+    # Append sample into session buffer (NO UI from threads)
     def push_sample_xyz(x, y, z):
         rms = float(math.sqrt((x*x + y*y + z*z) / 3.0))
         st.session_state.live_buffer.append(rms)
@@ -305,40 +306,61 @@ with tab_live:
             st.session_state.live_buffer.clear()
 
         demo = load_demo_dataframe()
-
         if {"x","y","z"}.issubset(demo.columns):
             xs, ys, zs = demo["x"].values, demo["y"].values, demo["z"].values
         else:
             rms = demo["vibration_rms"].values
             xs, ys, zs = rms*0.95, rms*1.02, rms*1.03
 
+        # push a few samples per frame when running
         if st.session_state.live_running:
-            for _ in range(sim_rate):
-                idx = np.random.randint(0, len(xs))
-                push_sample_xyz(xs[idx], ys[idx], zs[idx])
+            # sequential index looks smoother than random
+            if "sim_idx" not in st.session_state:
+                st.session_state.sim_idx = 0
+            end = st.session_state.sim_idx + sim_rate
+            for i in range(st.session_state.sim_idx, end):
+                j = i % len(xs)
+                push_sample_xyz(float(xs[j]), float(ys[j]), float(zs[j]))
+            st.session_state.sim_idx = end
 
+        # UI update
         recent = list(st.session_state.live_buffer)[-max_points:]
         if len(recent):
             live_placeholder.line_chart(pd.DataFrame({"vibration_rms": recent}))
+            debug_placeholder.info(f"Buffer size: {len(st.session_state.live_buffer)} • Last RMS: {recent[-1]:.4f}")
 
             if len(recent) > 200:
                 out_live = score_offline(model, pd.DataFrame({"vibration_rms": recent}))
                 stats_placeholder.metric("Detected Fault Windows", int((out_live["decisions"] == 1).sum()))
 
         time.sleep(update_interval / 1000.0)
-        st.experimental_rerun()
+        st.rerun()  # <-- modern API
 
     # ─────────────────────────────────────────────────────────────────────
-    # Mode B — REAL MQTT LIVE DATA
+    # Mode B — REAL MQTT LIVE DATA (WebSocket + optional TLS)
     # ─────────────────────────────────────────────────────────────────────
     if mode == "MQTT Live":
-        st.write("🌍 Connecting to Public MQTT Broker")
-        st.caption("Topic: `machine/vibration/data`  |  Format: `{ \"x\":0.54, \"y\":0.49, \"z\":0.61 }`")
+        st.write("🌍 Connect to public MQTT broker (HiveMQ).")
+        st.caption("Topic: `machine/vibration/data`  |  Payload: `{ \"x\":0.54, \"y\":0.49, \"z\":0.61 }`")
 
         if not MQTT_OK:
             st.error("Install MQTT first:  pip install paho-mqtt")
         else:
-            broker = "broker.hivemq.com"
+            use_tls = st.toggle("Use secure WebSocket (wss)", value=True,
+                                help="Enable for Streamlit Cloud; local dev can use ws://")
+            if use_tls:
+                broker = "broker.hivemq.com"
+                port = 8884
+                ws_path = "/mqtt"
+                use_ws = True
+                use_tls_flag = True
+            else:
+                broker = "broker.hivemq.com"
+                port = 8000
+                ws_path = "/mqtt"
+                use_ws = True
+                use_tls_flag = False
+
             topic = "machine/vibration/data"
 
             def on_connect(client, userdata, flags, rc, properties=None):
@@ -346,57 +368,71 @@ with tab_live:
                     st.session_state.mqtt_connected = True
                     client.subscribe(topic)
                 else:
-                    st.session_state.mqtt_last_err = f"MQTT failed (rc={rc})"
+                    st.session_state.mqtt_last_err = f"MQTT connect failed (rc={rc})"
 
             def on_message(client, userdata, msg):
                 try:
                     j = json.loads(msg.payload.decode("utf-8"))
-                    push_sample_xyz(float(j.get("x",0)), float(j.get("y",0)), float(j.get("z",0)))
-                except:
+                    x = float(j.get("x", 0))
+                    y = float(j.get("y", 0))
+                    z = float(j.get("z", 0))
+                    push_sample_xyz(x, y, z)
+                except Exception:
+                    # ignore a bad payload quietly
                     pass
 
             colA, colB, colC = st.columns(3)
 
             if colA.button("🔌 Connect"):
                 try:
-                    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets")
-                    client.ws_set_options(path="/mqtt")
+                    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets" if use_ws else "tcp")
+                    if use_ws:
+                        client.ws_set_options(path=ws_path)
+                    if use_tls_flag:
+                        import ssl
+                        client.tls_set(cert_reqs=ssl.CERT_NONE)  # public demo; relax cert
+                        client.tls_insecure_set(True)
+
                     client.on_connect = on_connect
                     client.on_message = on_message
-                    client.connect(broker, 8000, 60)
+                    client.connect(broker, port, 60)
                     client.loop_start()
                     st.session_state.mqtt_client = client
                 except Exception as e:
                     st.error(f"MQTT Error: {e}")
 
             if colB.button("🔕 Disconnect"):
-                if "mqtt_client" in st.session_state:
-                    st.session_state.mqtt_client.loop_stop()
-                    st.session_state.mqtt_client.disconnect()
+                c = st.session_state.get("mqtt_client")
+                if c:
+                    c.loop_stop()
+                    c.disconnect()
                 st.session_state.mqtt_connected = False
 
             if colC.button("🧹 Clear Data"):
                 st.session_state.live_buffer.clear()
 
             if st.session_state.mqtt_connected:
-                st.success("✅ Receiving real sensor data...")
+                st.success("✅ Connected & receiving data…")
             if st.session_state.mqtt_last_err:
                 st.warning(st.session_state.mqtt_last_err)
 
-        # UI update loop
+        # UI update driven by buffer content
         recent = list(st.session_state.live_buffer)[-max_points:]
         if len(recent):
             live_placeholder.line_chart(pd.DataFrame({"vibration_rms": recent}))
+            debug_placeholder.info(f"Buffer size: {len(st.session_state.live_buffer)} • Last RMS: {recent[-1]:.4f}")
 
             if len(recent) > 200:
                 out_live = score_offline(model, pd.DataFrame({"vibration_rms": recent}))
                 stats_placeholder.metric("Live Fault Windows", int((out_live["decisions"] == 1).sum()))
 
+        # If not connected, do not rerun forever
         if not st.session_state.mqtt_connected:
             st.stop()
 
-        time.sleep(update_interval / 1000)
-        st.experimental_rerun()
+        time.sleep(update_interval / 1000.0)
+        st.rerun()  # <-- modern API
+
 
 
 # ────────────────────────────────────────────────────────────────────────────────
