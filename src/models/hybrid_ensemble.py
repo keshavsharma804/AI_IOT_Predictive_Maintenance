@@ -54,59 +54,61 @@ class HybridEnsemble:
         return out[..., None]  # (N, seq_len, 1)
 
     # -------- Fit models --------
-    def fit(self, features_df: pd.DataFrame, raw_df: pd.DataFrame, signal_col: str = "vibration_rms"):
-        self.logger.info("Preparing features for Isolation Forest...")
+   def fit(self, features_df: pd.DataFrame, raw_df: pd.DataFrame, signal_col: str = "vibration_rms"):
+        print("---- HYBRID TRAINING START ----")
     
-        # Drop non-numeric / metadata columns
-        features_df = features_df.drop(columns=[
+        # 1) ===== Feature Preprocessing for Isolation Forest =====
+        print("Filtering non-numeric feature columns...")
+    
+        drop_cols = [
             c for c in features_df.columns
-            if any(x in c.lower() for x in 
-                   ["timestamp", "window", "machine", "failure", "severity", "label"])
-        ], errors='ignore')
+            if any(s in c.lower() for s in
+                   ["timestamp", "window", "machine", "failure", "severity", "label", "id"])
+        ]
+        features_df = features_df.drop(columns=drop_cols, errors="ignore")
     
-        # Select only numeric columns
         features_df = features_df.select_dtypes(include=['float32','float64','int32','int64'])
-    
         if features_df.shape[1] == 0:
-            raise ValueError("❌ No numeric features found after filtering!")
+            raise ValueError("❌ No numeric features available after filtering.")
+        print(f"✅ Using {features_df.shape[1]} numeric features for IF")
     
-        self.logger.info(f"✅ Numeric feature count: {features_df.shape[1]}")
-    
-        # Scale numeric features
         Xs = self.scaler.fit_transform(features_df)
-    
-        # Train Isolation Forest
         self.if_model.fit(Xs)
     
-        # Compute anomaly threshold
         if_scores = -self.if_model.decision_function(Xs)
-        self.if_score_threshold = float(np.percentile(if_scores, 95.0))
+        self.if_score_threshold = float(np.percentile(if_scores, 95))
     
-        # ---------------- LSTM PART ----------------
-        self.logger.info("Preparing raw signal for LSTM Autoencoder...")
+        # 2) ===== LSTM Autoencoder Training =====
+        print("Preparing raw signal for LSTM Autoencoder...")
     
         if signal_col not in raw_df.columns:
-            raise ValueError(f"Signal column '{signal_col}' not found in raw data")
+            raise ValueError(f"❌ Raw data missing signal column: {signal_col}")
     
-        signal = raw_df[signal_col].astype(float).values
-        seqs = self._make_sequences(signal, self.seq_len)
+        sig = raw_df[signal_col].astype(float).values
+        seqs = self._make_sequences(sig, self.seq_len)
     
         if len(seqs) == 0:
             raise ValueError("❌ Not enough raw samples to form sequences. Reduce --seq-len.")
     
-        self.lstm_model.fit(seqs)
+        print(f"✅ Created {seqs.shape[0]} training sequences for LSTM AE")
     
-        self.logger.info("✅ Hybrid Model Training Complete")
+        self.lstm = self._build_lstm_autoencoder(self.seq_len)
+        self.lstm.fit(seqs, seqs,
+                      epochs=self.lstm_epochs,
+                      batch_size=self.lstm_batch,
+                      verbose=1)
+    
+        print("✅ HYBRID MODEL TRAINING COMPLETE\n")
+
+
 
 
     # -------- Scoring --------
-    def score_features(self, features_df: pd.DataFrame):
-        non_feat = {"timestamp", "machine_id", "label"}
-        feat_cols = [c for c in features_df.columns if c not in non_feat]
-        X = features_df[feat_cols].values
-        Xs = self.scaler.transform(X)
-        if_scores = -self.if_model.decision_function(Xs)
-        return if_scores
+   def score_features(self, features_df: pd.DataFrame):
+        features_df = features_df.select_dtypes(include=['float32','float64','int32','int64'])
+        Xs = self.scaler.transform(features_df)
+        return -self.if_model.decision_function(Xs)
+
 
     def score_sequences(self, raw_df: pd.DataFrame, signal_col="vibration_rms"):
         signal = raw_df[signal_col].astype(float).values
