@@ -111,12 +111,11 @@ class HybridEnsemble:
 
 
 
-    # -------- Scoring --------
-   def score_features(self, features_df: pd.DataFrame):
+        # -------- Scoring --------
+    def score_features(self, features_df: pd.DataFrame):
         features_df = features_df.select_dtypes(include=['float32','float64','int32','int64'])
         Xs = self.scaler.transform(features_df)
         return -self.if_model.decision_function(Xs)
-
 
     def score_sequences(self, raw_df: pd.DataFrame, signal_col="vibration_rms"):
         signal = raw_df[signal_col].astype(float).values
@@ -125,11 +124,9 @@ class HybridEnsemble:
             return np.array([])
         pred = self.lstm.predict(seqs, verbose=0)
         recon_err = np.mean(np.abs(pred - seqs), axis=(1,2))
-        # expand to per-window mapping; align lengths later in predict()
         return recon_err
 
     def combine_scores(self, if_scores, lstm_scores):
-        # Normalize each to [0,1] by robust scaling
         def norm(x):
             if len(x) == 0:
                 return x
@@ -137,7 +134,6 @@ class HybridEnsemble:
             return np.clip((x - p1) / (p99 - p1 + 1e-8), 0, 1)
         a = norm(if_scores)
         b = norm(lstm_scores) if len(lstm_scores) else np.zeros_like(a)
-        # Align lengths (use min length)
         m = min(len(a), len(b)) if len(b) else len(a)
         a, b = a[:m], (b[:m] if len(b) else np.zeros(m))
         fused = self.fw_if * a + self.fw_lstm * b
@@ -184,3 +180,4 @@ class HybridEnsemble:
         h.if_score_threshold = meta["if_score_threshold"]
         print(f"✓ Hybrid ensemble loaded from: {dirpath}")
         return h
+
