@@ -1,0 +1,1 @@
+{"seq_len": 64, "lstm_units": 32, "lstm_epochs": 1, "lstm_batch": 128, "fw_if": 0.5, "fw_lstm": 0.5, "recon_threshold": 0.05375938822743506, "if_score_threshold": 0.006471853594150465}
