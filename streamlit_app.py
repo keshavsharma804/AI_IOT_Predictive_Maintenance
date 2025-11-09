@@ -1,166 +1,416 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+import json, time, math
+from collections import deque
 from pathlib import Path
-from scipy.signal import butter, filtfilt
-from scipy.stats import kurtosis, skew
+
+import numpy as np
+import pandas as pd
+import streamlit as st
 import matplotlib.pyplot as plt
-import seaborn as sns
+
+# Optional imports (graceful fallback if not present)
+try:
+    from scipy.signal import butter, filtfilt
+    from scipy.stats import kurtosis, skew
+    SCIPY_OK = True
+except Exception:
+    SCIPY_OK = False
+
+# MQTT optional
+MQTT_OK = True
+try:
+    import paho.mqtt.client as mqtt
+except Exception:
+    MQTT_OK = False
+
 from src.models.hybrid_ensemble import HybridEnsemble
 
-# -----------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
 # Page config
-# -----------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Predictive Maintenance Dashboard", page_icon="🛠️", layout="wide")
 
 ROOT = Path(".")
 MODEL_DIR = ROOT / "models" / "saved_models" / "hybrid"
 DEMO_CSV = ROOT / "data" / "synthetic" / "machine_001_demo.csv"
 
-# -----------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
 # Utilities
-# -----------------------------------
-def ensure_exists(p: Path):
+# ────────────────────────────────────────────────────────────────────────────────
+def ensure_exists(p: Path) -> bool:
     try:
         return p.exists()
-    except:
+    except Exception:
         return False
 
 @st.cache_resource
 def load_model():
+    required = ["if_model.pkl", "lstm_ae.keras", "scaler.pkl", "meta.json"]
+    missing = [f for f in required if not ensure_exists(MODEL_DIR / f)]
+    if missing:
+        st.error(
+            "❌ Trained model files missing in `models/saved_models/hybrid/`:\n" +
+            "\n".join(f"- {f}" for f in required)
+        )
+        st.stop()
     return HybridEnsemble.load(MODEL_DIR.as_posix())
 
 @st.cache_data
-def load_demo_data():
+def load_demo_dataframe() -> pd.DataFrame:
     if ensure_exists(DEMO_CSV):
         return pd.read_csv(DEMO_CSV)
+    # Tiny synthetic fallback (always available)
+    n = 5000
+    t = np.arange(n) / 200.0
+    # synthetic 3-axis with subtle differences
+    x = 0.5 + 0.05*np.sin(2*np.pi*3*t) + 0.02*np.random.randn(n)
+    y = 0.5 + 0.04*np.sin(2*np.pi*3.2*t + 0.3) + 0.02*np.random.randn(n)
+    z = 0.5 + 0.06*np.sin(2*np.pi*2.8*t - 0.2) + 0.02*np.random.randn(n)
+    # inject anomaly burst
+    z[2000:2100] += 0.25*np.sin(2*np.pi*15*t[2000:2100])
+    df = pd.DataFrame({"x": x, "y": y, "z": z})
+    df["vibration_rms"] = np.sqrt((df["x"]**2 + df["y"]**2 + df["z"]**2)/3.0)
+    return df
 
-    t = np.arange(4000)/200
-    vib = 0.5 + 0.05*np.sin(2*np.pi*3*t) + 0.02*np.random.randn(len(t))
-    vib[2000:2100] += 0.25*np.sin(2*np.pi*15*t[2000:2100])
-    return pd.DataFrame({"vibration_rms": vib})
+def lowpass(x, cutoff=50, fs=1000, order=4):
+    if not SCIPY_OK:
+        return x  # fallback: no filtering
+    b, a = butter(order, cutoff/(0.5*fs), btype="low")
+    return filtfilt(b, a, x)
 
-def butter_lowpass_filter(x, cutoff=50, fs=1000, order=4):
-    b,a = butter(order, cutoff/(0.5*fs), btype="low")
-    return filtfilt(b,a,x)
+def fuse_scores(model, if_scores: np.ndarray, lstm_scores: np.ndarray) -> np.ndarray:
+    try:
+        return model.combine_scores(if_scores, lstm_scores)
+    except Exception:
+        m = min(len(if_scores), len(lstm_scores))
+        return 0.5 * if_scores[:m] + 0.5 * lstm_scores[:m]
 
-def fuse_scores(if_scores, lstm_scores):
-    m = min(len(if_scores), len(lstm_scores))
-    return 0.5*if_scores[:m] + 0.5*lstm_scores[:m]
-
-def make_decisions(fused, baseline=2000, pctl=99):
+def make_decisions(fused: np.ndarray, baseline: int = 2000, pctl: float = 99.0) -> np.ndarray:
+    if len(fused) == 0:
+        return np.array([], dtype=int)
     thr = np.percentile(fused[:min(baseline, len(fused))], pctl)
-    return (fused >= thr).astype(int)
+    return (fused >= thr).astype(int), float(thr)
 
-# -----------------------------------
-# Load model
-# -----------------------------------
+@st.cache_data(show_spinner=False)
+def score_offline(model: HybridEnsemble, df: pd.DataFrame) -> dict:
+    lstm_scores = model.score_sequences(df, signal_col="vibration_rms")
+    if_scores = np.zeros_like(lstm_scores)
+    fused = fuse_scores(model, if_scores, lstm_scores)
+    decisions, thr = make_decisions(fused, baseline=2000, pctl=99.0)
+    return {
+        "lstm_scores": lstm_scores,
+        "if_scores": if_scores,
+        "fused": fused,
+        "decisions": decisions,
+        "threshold": thr,
+    }
+
+def compute_features(sig: np.ndarray) -> pd.DataFrame:
+    rms = float(np.sqrt(np.mean(sig**2)))
+    peak = float(np.max(np.abs(sig)))
+    krt = float(kurtosis(sig)) if SCIPY_OK else float("nan")
+    skw = float(skew(sig)) if SCIPY_OK else float("nan")
+    return pd.DataFrame({"RMS":[rms], "Peak":[peak], "Kurtosis":[krt], "Skewness":[skw]})
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Session state for Live modes
+# ────────────────────────────────────────────────────────────────────────────────
+if "live_buffer" not in st.session_state:
+    st.session_state.live_buffer = deque(maxlen=6000)   # keep ~ last 6k samples
+if "live_running" not in st.session_state:
+    st.session_state.live_running = False
+if "mqtt_connected" not in st.session_state:
+    st.session_state.mqtt_connected = False
+if "mqtt_last_err" not in st.session_state:
+    st.session_state.mqtt_last_err = ""
+if "asset_name" not in st.session_state:
+    st.session_state.asset_name = "Motor-001"
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Load model & data source selection
+# ────────────────────────────────────────────────────────────────────────────────
 model = load_model()
 
-# -----------------------------------
-# UI Header
-# -----------------------------------
-st.title("🛠️ AI-Based Predictive Maintenance Dashboard")
-st.write("""
-This dashboard analyzes **vibration sensor data** to detect **early machine faults**, using:
+with st.sidebar:
+    st.header("📦 Data Source")
+    source = st.radio(
+        "Choose input",
+        ["Upload / CSV", "Demo (static)", "Simulated Stream (A2)", "MQTT Live"],
+        index=1,
+        help="Switches the dashboard between offline analysis and live modes."
+    )
+    st.text_input("Asset Name", value=st.session_state.asset_name, key="asset_name")
 
-- 🧠 *LSTM Autoencoder* → learns normal vibration patterns  
-- 🌲 *Isolation Forest* → detects statistical outliers  
+    st.divider()
+    st.header("⚙️ Visualization")
+    max_points = st.slider("Max chart points (downsample)", 200, 4000, 800, 100)
+    update_interval = st.slider("Live update (ms)", 100, 1500, 400, 50)
+
+    st.divider()
+    if not SCIPY_OK:
+        st.warning("`scipy` not available → filtering/feature kurtosis/skew use fallbacks.", icon="⚠️")
+    if not MQTT_OK:
+        st.info("Install `paho-mqtt` to enable MQTT live mode.", icon="ℹ️")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Tabs keep your earlier sections but compute on demand (faster)
+# ────────────────────────────────────────────────────────────────────────────────
+tab_overview, tab_signals, tab_freq, tab_features, tab_anom, tab_live, tab_admin = st.tabs(
+    ["Overview", "Signals", "Filters & FFT", "Features", "Anomalies", "Live", "Admin"]
+)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Source: Upload / Demo (offline analysis)
+# ────────────────────────────────────────────────────────────────────────────────
+if source in ["Upload / CSV", "Demo (static)"]:
+    with tab_overview:
+        st.title("🛠️ AI-Based Predictive Maintenance Dashboard")
+        st.write("""
+**Hybrid Ensemble:** LSTM Autoencoder (sequence) + Isolation Forest (feature)  
+Detects **early faults** in rotating machinery from vibration signals.
 """)
 
-# Upload
-uploaded = st.file_uploader("Upload CSV (supports vibration X/Y/Z, temperature, acoustic)", type=["csv"])
+        if source == "Upload / CSV":
+            up = st.file_uploader("Upload CSV containing `vibration_rms` or axes x,y,z", type=["csv"])
+            if up is None:
+                st.stop()
+            df = pd.read_csv(up)
+        else:
+            df = load_demo_dataframe()
 
-if uploaded:
-    data = pd.read_csv(uploaded)
-    st.success("✅ File loaded successfully!")
-else:
-    st.info("ℹ️ Using demo dataset.")
-    data = load_demo_data()
+        # Accept x,y,z too → compute vibration_rms
+        if "vibration_rms" not in df.columns:
+            axes = {"x","y","z"}
+            if axes.issubset(df.columns):
+                df["vibration_rms"] = np.sqrt((df["x"]**2 + df["y"]**2 + df["z"]**2)/3.0)
+            else:
+                st.error("❌ Provide `vibration_rms` or columns `x,y,z`.")
+                st.stop()
 
-if "vibration_rms" not in data.columns:
-    st.error("Dataset must contain a `vibration_rms` column.")
-    st.stop()
+        with st.spinner("Scoring with LSTM…"):
+            out = score_offline(model, df)
 
-# -----------------------------------
-# Raw Signal Visualization (FAST with DOWNSAMPLING)
-# -----------------------------------
-st.subheader("📊 Raw Sensor Signal(s)")
-possible_signals = [c for c in data.columns if c not in ["timestamp"]]
-selected_signals = st.multiselect("Select signals to visualize:", possible_signals, default=["vibration_rms"])
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Samples", len(df))
+        c2.metric("Windows Scored", int(len(out["fused"])))
+        c3.metric("Fault Windows", int((out["decisions"]==1).sum()))
 
-ds = max(len(data)//800, 1)   # Downsample for performance
-if selected_signals:
-    st.line_chart(data[selected_signals][::ds])
+        # Anomaly trend (downsampled)
+        step = max(1, len(out["fused"]) // max_points)
+        fused_view = out["fused"][::step]
+        st.subheader("📈 Anomaly Score Timeline")
+        st.line_chart(pd.DataFrame({"Anomaly Score": fused_view}))
 
-# -----------------------------------
-# Filtering & FFT (Downsampled for Speed)
-# -----------------------------------
-st.subheader("🔧 Filtered Signal (Noise Reduction)")
-data["filtered"] = butter_lowpass_filter(data["vibration_rms"])
-st.line_chart(data[["vibration_rms","filtered"]][::ds])
+        st.caption(f"Decision threshold (99th pct on baseline): {out['threshold']:.4f}")
 
-st.subheader("⚡ Frequency Spectrum (FFT)")
-signal = data["vibration_rms"].values
-freq = np.fft.rfftfreq(len(signal), 1/1000)
-amp = np.abs(np.fft.rfft(signal))
-fft_ds = max(len(freq)//800,1)
-st.line_chart(pd.DataFrame({"Amplitude": amp[::fft_ds]}, index=freq[::fft_ds]))
+    with tab_signals:
+        st.subheader("📊 Raw Signals")
+        cols = [c for c in df.columns if c not in ["timestamp"]]
+        sel = st.multiselect("Select signals to plot", cols, default=[c for c in ["x","y","z","vibration_rms"] if c in cols])
+        if sel:
+            view = df[sel].iloc[::max(1, len(df)//max_points)]
+            st.line_chart(view)
 
-# -----------------------------------
-# Feature Extraction
-# -----------------------------------
-st.subheader("📐 Extracted Signal Features")
-feat = pd.DataFrame([{
-    "RMS": np.sqrt(np.mean(signal**2)),
-    "Peak": np.max(np.abs(signal)),
-    "Kurtosis": kurtosis(signal),
-    "Skewness": skew(signal)
-}])
-st.table(feat)
+    with tab_freq:
+        st.subheader("🔧 Filtered Signal (Low-Pass)")
+        if SCIPY_OK:
+            filt = lowpass(df["vibration_rms"].values)
+            view = pd.DataFrame({"vibration_rms": df["vibration_rms"].iloc[::10].values[:len(filt[::10])],
+                                 "filtered": filt[::10]})
+            st.line_chart(view)
+        else:
+            st.info("Install `scipy` to enable filtering.")
 
-# -----------------------------------
-# Run LSTM Model (CACHED for Speed)
-# -----------------------------------
-@st.cache_data
-def run_inference(data):
-    lstm_scores = model.score_sequences(data, "vibration_rms")
-    if_scores = np.zeros_like(lstm_scores)
-    fused = fuse_scores(if_scores, lstm_scores)
-    decisions = make_decisions(fused)
-    return lstm_scores, if_scores, fused, decisions
+        st.subheader("⚡ Frequency Spectrum (FFT)")
+        sig = df["vibration_rms"].values
+        freq = np.fft.rfftfreq(len(sig), 1/1000)
+        amp = np.abs(np.fft.rfft(sig))
+        step_f = max(1, len(amp)//max_points)
+        fft_df = pd.DataFrame({"Amplitude": amp[::step_f]}, index=freq[::step_f])
+        st.line_chart(fft_df)
 
-lstm_scores, if_scores, fused, decisions = run_inference(data)
+    with tab_features:
+        st.subheader("📐 Extracted Features")
+        feats = compute_features(df["vibration_rms"].values)
+        st.table(feats)
 
-st.metric("Samples Processed", len(data))
-st.metric("Faulty Windows", int(decisions.sum()))
+    with tab_anom:
+        st.subheader("🔍 Anomaly Details")
+        out = score_offline(model, df)
+        fused = out["fused"]; decisions = out["decisions"]
+        fault_idx = np.where(decisions == 1)[0]
+        if len(fault_idx)==0:
+            st.success("✅ No anomalies detected.")
+        else:
+            st.error(f"⚠️ {len(fault_idx)} fault windows detected.")
+            st.write(f"First 50 fault windows: {fault_idx[:50].tolist()}")
 
-# -----------------------------------
-# LSTM Reconstruction Comparison (Downsampled)
-# -----------------------------------
-st.subheader("🧠 LSTM Reconstruction Comparison")
-try:
-    reconstructed = model.reconstruct_sequences(data, "vibration_rms")
-    comp = pd.DataFrame({
-        "Original": data["vibration_rms"][::ds][:len(reconstructed)],
-        "Reconstructed": reconstructed[::ds]
-    })
-    st.line_chart(comp)
-except:
-    st.info("Reconstruction visualization unavailable.")
+        # Heatmap (lightweight)
+        fig, ax = plt.subplots(figsize=(12, 2))
+        ax.imshow(fused[np.newaxis, :], aspect="auto", cmap="coolwarm")
+        ax.set_yticks([])
+        ax.set_xlabel("Window Index")
+        ax.set_title("Fault Heatmap")
+        st.pyplot(fig)
 
-# -----------------------------------
-# Fault Heatmap (Downsampled)
-# -----------------------------------
-st.subheader("🔥 Fault Heatmap")
-fused_ds = fused[::ds]
-fig, ax = plt.subplots(figsize=(12,2))
-sns.heatmap([fused_ds], cmap="coolwarm", ax=ax, cbar=False)
-st.pyplot(fig)
+        # Download
+        res = pd.DataFrame({
+            "index": np.arange(len(fused)),
+            "lstm_score": out["lstm_scores"][:len(fused)],
+            "if_score": out["if_scores"][:len(fused)],
+            "fused_score": fused,
+            "label": decisions
+        })
+        st.download_button("⬇️ Download Predictions CSV", res.to_csv(index=False).encode("utf-8"),
+                           file_name="predictions.csv", mime="text/csv")
 
-# -----------------------------------
-# Download Results
-# -----------------------------------
-st.download_button("⬇️ Download Predictions CSV", 
-    pd.DataFrame({"fused_score": fused, "label": decisions}).to_csv(index=False),
-    "predictions.csv", "text/csv")
+# ────────────────────────────────────────────────────────────────────────────────
+# LIVE tab: Simulated Stream (A2) and MQTT
+# ────────────────────────────────────────────────────────────────────────────────
+with tab_live:
+    st.subheader("🟢 Live Monitoring")
+
+    mode = st.radio("Live mode", ["Simulated Stream (A2)", "MQTT Live"], horizontal=True)
+
+    # Common live chart setup
+    live_placeholder = st.empty()
+    stats_placeholder = st.empty()
+
+    def push_sample_xyz(x, y, z):
+        rms = float(math.sqrt((x*x + y*y + z*z)/3.0))
+        st.session_state.live_buffer.append(rms)
+        # keep chart snappy by limiting points
+        buf = np.array(st.session_state.live_buffer)[-max_points:]
+        df_view = pd.DataFrame({"vibration_rms": buf})
+        live_placeholder.line_chart(df_view)
+
+        # Score in mini-batches for speed
+        if len(buf) >= 200:
+            tmp_df = pd.DataFrame({"vibration_rms": buf})
+            out = score_offline(model, tmp_df)
+            faults = int((out["decisions"] == 1).sum())
+            stats_placeholder.metric("Live Fault Windows (buffer)", faults)
+
+    if mode == "Simulated Stream (A2)":
+        st.write("Reads demo data and streams it live.")
+        sim_rate = st.slider("Samples per update", 1, 50, 10, 1)
+
+        cols = st.columns(3)
+        if cols[0].button("▶️ Start"):
+            st.session_state.live_running = True
+        if cols[1].button("⏸️ Pause"):
+            st.session_state.live_running = False
+        if cols[2].button("🛑 Reset"):
+            st.session_state.live_running = False
+            st.session_state.live_buffer.clear()
+
+        demo = load_demo_dataframe()
+        # if demo has axes, use them; else synthesize x,y,z from rms
+        if {"x","y","z"}.issubset(demo.columns):
+            xs, ys, zs = demo["x"].values, demo["y"].values, demo["z"].values
+        else:
+            rms = demo["vibration_rms"].values
+            # fake x,y,z around rms (for visualization only)
+            xs, ys, zs = rms*0.95, rms*1.02, rms*1.03
+
+        i = 0
+        # Single pass loop per rerun, keeps UI responsive
+        if st.session_state.live_running:
+            end = min(i + sim_rate, len(xs))
+            for k in range(sim_rate):
+                idx = (i + k) % len(xs)
+                push_sample_xyz(float(xs[idx]), float(ys[idx]), float(zs[idx]))
+            time.sleep(update_interval / 1000.0)
+
+    else:
+        st.write("Connects to a public MQTT broker (`broker.hivemq.com`).")
+        st.caption("Topic: `machine/vibration/data` • Expected JSON: `{ \"x\":0.54, \"y\":0.49, \"z\":0.61 }`")
+        if not MQTT_OK:
+            st.error("`paho-mqtt` not installed. Add `paho-mqtt` to requirements.txt.")
+        else:
+            broker = "broker.hivemq.com"
+            topic = "machine/vibration/data"
+
+            def on_connect(client, userdata, flags, rc, properties=None):
+                if rc == 0:
+                    st.session_state.mqtt_connected = True
+                    client.subscribe(topic, qos=0)
+                else:
+                    st.session_state.mqtt_last_err = f"Connect failed (rc={rc})"
+
+            def on_message(client, userdata, msg):
+                try:
+                    payload = json.loads(msg.payload.decode("utf-8"))
+                    x = float(payload.get("x"))
+                    y = float(payload.get("y"))
+                    z = float(payload.get("z"))
+                    push_sample_xyz(x, y, z)
+                except Exception as e:
+                    st.session_state.mqtt_last_err = f"Bad payload: {e}"
+
+            cols = st.columns(3)
+            if cols[0].button("🔌 Connect"):
+                try:
+                    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+                    client.on_connect = on_connect
+                    client.on_message = on_message
+                    # Non-blocking loop
+                    client.connect(broker, 1883, 60)
+                    client.loop_start()
+                    st.session_state.mqtt_client = client
+                except Exception as e:
+                    st.error(f"MQTT connect error: {e}")
+
+            if cols[1].button("🔕 Disconnect"):
+                c = st.session_state.get("mqtt_client")
+                if c:
+                    c.loop_stop()
+                    c.disconnect()
+                st.session_state.mqtt_connected = False
+
+            if cols[2].button("🧹 Clear Buffer"):
+                st.session_state.live_buffer.clear()
+
+            if st.session_state.mqtt_connected:
+                st.success("Connected to MQTT broker.")
+            if st.session_state.mqtt_last_err:
+                st.warning(st.session_state.mqtt_last_err)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Admin: Asset table & thresholds
+# ────────────────────────────────────────────────────────────────────────────────
+with tab_admin:
+    st.subheader("🏷️ Asset Health Table")
+
+    # Build a lightweight snapshot row from latest buffer / last offline result if any
+    latest_obs = None
+    if len(st.session_state.live_buffer) > 0:
+        latest_obs = float(st.session_state.live_buffer[-1])
+
+    threshold_hint = 0.6  # display-only default; your model threshold is percentile-based
+    status = "OK"
+    priority = "Low"
+    if latest_obs is not None and latest_obs > threshold_hint:
+        status = "Alert"
+        priority = "High"
+
+    created_on = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
+    asset = st.session_state.asset_name
+
+    table = pd.DataFrame([{
+        "Asset Name": asset,
+        "Signal": "vibration_rms",
+        "Priority": priority,
+        "Status": status,
+        "Created On": created_on,
+        "Threshold": threshold_hint,
+        "Observed": latest_obs if latest_obs is not None else np.nan
+    }])
+
+    st.dataframe(table, use_container_width=True)
+
+    st.download_button(
+        "⬇️ Export Asset Table (CSV)",
+        data=table.to_csv(index=False).encode("utf-8"),
+        file_name="asset_health_table.csv",
+        mime="text/csv"
+    )
