@@ -1,37 +1,93 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import time
 from src.models.hybrid_ensemble import HybridEnsemble
 
-# Load saved hybrid model
-model = HybridEnsemble.load("./models/saved_models/hybrid")
+# -------------------------------
+# Page Configuration
+# -------------------------------
+st.set_page_config(
+    page_title="Predictive Maintenance Dashboard",
+    page_icon="🛠️",
+    layout="wide"
+)
 
-st.title("🟢 Real-Time Machine Health Dashboard")
+# -------------------------------
+# Load Model
+# -------------------------------
+@st.cache_resource
+def load_model():
+    return HybridEnsemble.load("models/saved_models/hybrid")
 
-# Load latest features and raw data
-features = pd.read_csv("data/features/machine_001_features.csv")
-raw = pd.read_csv("data/synthetic/machine_001_data.csv")
+model = load_model()
 
-# Get predictions
-if_scores = model.score_features(features)
-lstm_scores = model.score_sequences(raw, "vibration_rms")
-fused = model.combine_scores(if_scores, lstm_scores)
+st.title("🛠️ AI-Based Predictive Maintenance Dashboard")
+st.write(
+    """
+This dashboard uses a **Hybrid Ensemble Model** combining **Isolation Forest** (feature anomaly detection)  
+and **LSTM Autoencoder** (vibration pattern reconstruction)  
+to detect early mechanical failures in rotating machines.
+"""
+)
 
-threshold = np.percentile(fused[:2000], 99)
-labels = (fused >= threshold).astype(int)
+# -------------------------------
+# File Upload Section
+# -------------------------------
+st.header("📤 Upload Machine Sensor Data")
+uploaded_file = st.file_uploader(
+    "Upload CSV containing `vibration_rms` column",
+    type=["csv"]
+)
 
-# Summary Box
-normal = (labels == 0).sum()
-fault = (labels == 1).sum()
+if uploaded_file is not None:
+    data = pd.read_csv(uploaded_file)
 
-st.metric("Normal Windows", normal)
-st.metric("Fault Windows", fault)
+    if "vibration_rms" not in data.columns:
+        st.error("❌ The uploaded file must contain a column named **vibration_rms**.")
+        st.stop()
 
-# Live Timeline Chart
-chart = st.line_chart()
+    st.success("✅ Data uploaded successfully!")
 
-for i in range(len(fused)):
-    chart.add_rows({"anomaly_score": fused[i]})
-    time.sleep(0.01)
+    # -------------------------------
+    # Run Model Scoring
+    # -------------------------------
+    st.subheader("🔍 Running Anomaly Detection...")
 
+    lstm_scores = model.score_sequences(data, signal_col="vibration_rms")
+    if_scores = np.zeros_like(lstm_scores)  # No feature set → 0 baseline score
+
+    fused = model.combine_scores(if_scores, lstm_scores)
+    decisions = model.decision(fused, fusion_threshold=0.6)
+
+    # -------------------------------
+    # Metrics Summary
+    # -------------------------------
+    col1, col2 = st.columns(2)
+    col1.metric("✅ Healthy Windows", (decisions == 0).sum())
+    col2.metric("⚠️ Faulty Windows Detected", (decisions == 1).sum())
+
+    # -------------------------------
+    # Line Chart Visualization
+    # -------------------------------
+    st.subheader("📈 Machine Vibration Health Trend")
+    df_plot = pd.DataFrame({
+        "Anomaly Score": fused,
+        "Status (0=Normal,1=Fault)": decisions
+    })
+
+    st.line_chart(df_plot["Anomaly Score"])
+
+    # -------------------------------
+    # Highlight Fault Segments
+    # -------------------------------
+    st.subheader("🚨 Detected Fault Regions")
+    fault_indices = np.where(decisions == 1)[0]
+
+    if len(fault_indices) == 0:
+        st.success("✅ No anomalies detected. Machine is operating normally.")
+    else:
+        st.error("⚠️ Fault detected! Possible early-stage mechanical degradation.")
+        st.write(f"Fault points at data windows: **{fault_indices.tolist()}**")
+
+else:
+    st.info("👆 Upload a CSV file to begin analysis.")
