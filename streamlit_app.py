@@ -90,7 +90,7 @@ def make_decisions(fused: np.ndarray, baseline: int = 2000, pctl: float = 99.0) 
     thr = np.percentile(fused[:min(baseline, len(fused))], pctl)
     return (fused >= thr).astype(int), float(thr)
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(hash_funcs={pd.DataFrame: lambda _: None})
 def score_offline(model: HybridEnsemble, df: pd.DataFrame) -> dict:
     lstm_scores = model.score_sequences(df, signal_col="vibration_rms")
     if_scores = np.zeros_like(lstm_scores)
