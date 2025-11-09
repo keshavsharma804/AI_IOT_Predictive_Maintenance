@@ -56,12 +56,28 @@ class HybridEnsemble:
     # -------- Fit models --------
     def fit(self, features_df: pd.DataFrame, raw_df: pd.DataFrame, signal_col: str = "vibration_rms"):
         # -------- Isolation Forest on features --------
-        non_feat = {"timestamp", "machine_id", "label"}
-        feat_cols = [c for c in features_df.columns if c not in non_feat]
-        X = features_df[feat_cols].values
-        X = X.select_dtypes(include=['float32', 'float64', 'int32', 'int64'])
-        Xs = self.scaler.fit_transform(X)
+        # -------- Isolation Forest on feature table --------
+        non_numeric = {"timestamp", "window_start", "window_end", "machine_id", "failure_type", "severity", "label"}
+        
+        # Drop metadata / non-numeric columns
+        feat_df = features_df.drop(columns=[c for c in features_df.columns if c in non_numeric], errors='ignore')
+        
+        # Keep numeric columns only
+        feat_df = feat_df.select_dtypes(include=['float32', 'float64', 'int32', 'int64'])
+        
+        if feat_df.shape[1] == 0:
+            raise ValueError("No numeric features available for model training.")
+        
+        # Scale numeric features
+        Xs = self.scaler.fit_transform(feat_df.values)
+        
+        # Train Isolation Forest
         self.if_model.fit(Xs)
+        
+        # Compute anomaly score threshold
+        if_scores = -self.if_model.decision_function(Xs)
+        self.if_score_threshold = float(np.percentile(if_scores, 95.0))
+
 
         # Choose IF threshold ~ 95th percentile of scores on train normal
         if_scores = -self.if_model.decision_function(Xs)  # higher = more anomalous
