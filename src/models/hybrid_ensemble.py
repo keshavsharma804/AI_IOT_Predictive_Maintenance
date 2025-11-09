@@ -59,6 +59,7 @@ class HybridEnsemble:
         non_feat = {"timestamp", "machine_id", "label"}
         feat_cols = [c for c in features_df.columns if c not in non_feat]
         X = features_df[feat_cols].values
+        X = X.select_dtypes(include=['float32', 'float64', 'int32', 'int64'])
         Xs = self.scaler.fit_transform(X)
         self.if_model.fit(Xs)
 
