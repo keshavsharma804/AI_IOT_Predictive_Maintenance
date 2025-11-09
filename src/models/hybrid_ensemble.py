@@ -76,8 +76,9 @@ class HybridEnsemble:
         errors = np.mean(np.abs(preds - seqs), axis=(1,2))
         self.recon_threshold = float(np.percentile(errors, 95))
 
-        print("✅ Hybrid Model Training Completed")
+        print("✅ Hybrid Model Training Complete")
 
+    # -------- Scoring --------
     def score_features(self, features_df: pd.DataFrame):
         features_df = features_df.select_dtypes(include=['float32','float64','int32','int64'])
         Xs = self.scaler.transform(features_df)
@@ -89,15 +90,24 @@ class HybridEnsemble:
         if len(seqs) == 0:
             return np.array([])
         pred = self.lstm.predict(seqs, verbose=0)
-        return np.mean(np.abs(pred - seqs), axis=(1,2))
+        recon_err = np.mean(np.abs(pred - seqs), axis=(1,2))
+        return recon_err
 
     def combine_scores(self, if_scores, lstm_scores):
         def norm(x):
+            if len(x) == 0:
+                return x
             p1, p99 = np.percentile(x, 1), np.percentile(x, 99)
             return np.clip((x - p1) / (p99 - p1 + 1e-8), 0, 1)
-        a, b = norm(if_scores), norm(lstm_scores) if len(lstm_scores) else np.zeros_like(if_scores)
-        m = min(len(a), len(b)) if len(b) else len(a)
-        return self.fw_if * a[:m] + self.fw_lstm * b[:m]
 
-    def decision(self, fused_scores, threshold=0.6):
-        return (fused_scores >= threshold).astype(int)
+        a = norm(if_scores)
+        b = norm(lstm_scores) if len(lstm_scores) else np.zeros_like(a)
+
+        m = min(len(a), len(b)) if len(b) else len(a)
+        a, b = a[:m], (b[:m] if len(b) else np.zeros(m))
+
+        fused = self.fw_if * a + self.fw_lstm * b
+        return fused
+
+    def decision(self, fused_scores, fusion_threshold=0.6):
+        return (fused_scores >= fusion_threshold).astype(int)
