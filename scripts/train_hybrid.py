@@ -1,6 +1,11 @@
 # scripts/train_hybrid.py
+
+import sys, os
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+sys.path.append(PROJECT_ROOT)
 import argparse, pandas as pd
 from src.models.hybrid_ensemble import HybridEnsemble
+from src.data.data_loader import DataLoader
 
 def main():
     p = argparse.ArgumentParser()
