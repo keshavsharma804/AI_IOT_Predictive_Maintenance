@@ -124,15 +124,26 @@ def compute_features(sig: np.ndarray) -> pd.DataFrame:
 # Session state for Live modes
 # ────────────────────────────────────────────────────────────────────────────────
 if "live_buffer" not in st.session_state:
-    st.session_state.live_buffer = deque(maxlen=6000)   # keep ~ last 6k samples
+    st.session_state.live_buffer = deque(maxlen=6000)   # vibration RMS
+
+if "live_rpm" not in st.session_state:
+    st.session_state.live_rpm = deque(maxlen=6000)      # RPM / speed
+
+if "live_temp" not in st.session_state:
+    st.session_state.live_temp = deque(maxlen=6000)     # Temperature
+
 if "live_running" not in st.session_state:
     st.session_state.live_running = False
+
 if "mqtt_connected" not in st.session_state:
     st.session_state.mqtt_connected = False
+
 if "mqtt_last_err" not in st.session_state:
     st.session_state.mqtt_last_err = ""
+
 if "asset_name" not in st.session_state:
     st.session_state.asset_name = "Motor-001"
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Load model & data source selection
@@ -275,218 +286,145 @@ Detects **early faults** in rotating machinery from vibration signals.
 # ────────────────────────────────────────────────────────────────────────────────
 # LIVE tab: Simulated Stream (A2) and MQTT  (REPLACE THIS WHOLE BLOCK)
 # ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# LIVE tab: Simulated Stream (A2) and MQTT
+# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# LIVE tab: Simulated Stream (A2) and MQTT
+# ────────────────────────────────────────────────────────────────────────────────
 with tab_live:
     st.subheader("🟢 Live Monitoring (Real-Time)")
 
     mode = st.radio("Select Live Mode:", ["Simulated Stream (A2)", "MQTT Live"], horizontal=True)
 
-    # Placeholders
-    kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
-    live_placeholder = st.empty()
-    meta_placeholder = st.empty()
-    debug_placeholder = st.empty()
+    # KPI + charts placeholders
+    k1, k2, k3, k4 = st.columns(4)
+    chart_area = st.empty()
+    status_area = st.empty()
 
-    # ---- small live scorer (no cache; used only on short buffers) ----
-    def score_live_window(model: HybridEnsemble, arr: np.ndarray):
+    # Quick scorer for live windows
+    def score_live_window(arr):
         if len(arr) < 32:
             return np.array([]), np.array([]), 0.0
         df = pd.DataFrame({"vibration_rms": arr})
         lstm = model.score_sequences(df, "vibration_rms")
         ifs = np.zeros_like(lstm)
         fused = fuse_scores(model, ifs, lstm)
-        base = min(200, len(fused))
-        thr = float(np.percentile(fused[:base], 99))
+        thr = np.percentile(fused[:min(200, len(fused))], 99)
         dec = (fused >= thr).astype(int)
-        return fused, dec, thr
+        return fused, dec, float(thr)
 
-    # ---- append sample(s) into session buffers (no UI in callbacks) ----
-    def push_sample_xyz(x: float, y: float, z: float, rpm: float | None = None, temp: float | None = None):
-        rms = float(math.sqrt((x*x + y*y + z*z) / 3.0))
+    # Push samples to buffer
+    def push_sample_data(x, y, z, rpm=None, temp=None):
+        rms = math.sqrt((x*x + y*y + z*z) / 3.0)
         st.session_state.live_buffer.append(rms)
-        if rpm is not None:
-            st.session_state.live_rpm.append(float(rpm))
-        if temp is not None:
-            st.session_state.live_temp.append(float(temp))
+        if rpm is not None: st.session_state.live_rpm.append(float(rpm))
+        if temp is not None: st.session_state.live_temp.append(float(temp))
 
     # ─────────────────────────────
-    # Mode A2 — simulated streaming
+    # MODE A2 - Simulated Stream
     # ─────────────────────────────
     if mode == "Simulated Stream (A2)":
-        st.write("📡 Streaming from demo data as live feed")
+        st.write("📡 Streaming demo data live...")
 
-        # controls
-        sim_rate = st.slider("Samples per frame", 1, 100, 20)
-        base_rpm = st.slider("Base RPM (sim)", 600, 3600, 1500, 100)
-        base_temp = st.slider("Base Temp °C (sim)", 30, 100, 65, 1)
-
-        cstart, cpause, creset = st.columns(3)
-        if cstart.button("▶️ Start"):
-            st.session_state.live_running = True
-        if cpause.button("⏸️ Pause"):
-            st.session_state.live_running = False
-        if creset.button("🛑 Reset"):
-            st.session_state.live_running = False
-            st.session_state.live_buffer.clear()
-            st.session_state.live_rpm.clear()
-            st.session_state.live_temp.clear()
-            st.session_state.pop("sim_idx", None)
-
+        sim_rate = st.slider("Samples per update", 1, 100, 20)
         demo = load_demo_dataframe()
+
         if {"x","y","z"}.issubset(demo.columns):
             xs, ys, zs = demo["x"].values, demo["y"].values, demo["z"].values
         else:
             rms = demo["vibration_rms"].values
             xs, ys, zs = rms*0.97, rms*1.01, rms*1.03
 
-        # emit a few samples per frame when running
+        if st.button("Start Simulation"):
+            st.session_state.live_running = True
+
         if st.session_state.live_running:
-            if "sim_idx" not in st.session_state:
-                st.session_state.sim_idx = 0
-            i0, i1 = st.session_state.sim_idx, st.session_state.sim_idx + sim_rate
-            for i in range(i0, i1):
+            if "sim_idx" not in st.session_state: st.session_state.sim_idx = 0
+            for i in range(st.session_state.sim_idx, st.session_state.sim_idx + sim_rate:
                 j = i % len(xs)
-                # synthesize rpm/temp with slight drift + noise
-                rpm = base_rpm + 30*np.sin(2*np.pi*(j/500.0)) + np.random.randn()*5
-                temp = base_temp + 2.0*np.sin(2*np.pi*(j/900.0)) + np.random.randn()*0.3
-                push_sample_xyz(float(xs[j]), float(ys[j]), float(zs[j]), rpm=rpm, temp=temp)
-            st.session_state.sim_idx = i1
+                push_sample_data(xs[j], ys[j], zs[j],
+                                 rpm=1500 + 20*np.sin(j/200),
+                                 temp=65 + 1.5*np.sin(j/350))
+            st.session_state.sim_idx += sim_rate
 
-        # draw UI from latest buffer
-        recent = np.array(list(st.session_state.live_buffer)[-max_points:])
-        recent_rpm = np.array(list(st.session_state.live_rpm)[-max_points:]) if len(st.session_state.live_rpm) else None
-        recent_tmp = np.array(list(st.session_state.live_temp)[-max_points:]) if len(st.session_state.live_temp) else None
+        recent = list(st.session_state.live_buffer)[-max_points:]
+        recent_rpm = list(st.session_state.live_rpm)[-max_points:]
+        recent_temp = list(st.session_state.live_temp)[-max_points:]
 
-        # KPIs (computed on short buffer)
-        if recent.size:
-            fused, dec, thr = score_live_window(model, recent)
-            faults = int((dec == 1).sum()) if dec.size else 0
-            last_rms = float(recent[-1])
-            last_rpm = float(recent_rpm[-1]) if recent_rpm is not None and recent_rpm.size else float("nan")
-            last_tmp = float(recent_tmp[-1]) if recent_tmp is not None and recent_tmp.size else float("nan")
-            last_fused = float(fused[-1]) if fused.size else 0.0
-            health = max(0.0, 100.0*(1.0 - (last_fused / (thr + 1e-9))))
-            health = float(np.clip(health, 0, 100))
+        if recent:
+            fused, dec, thr = score_live_window(np.array(recent))
+            faults = (dec == 1).sum() if len(dec) else 0
 
-            kpi_col1.metric("Health Score", f"{health:.0f} %")
-            kpi_col2.metric("RPM", f"{last_rpm:.0f}" if not math.isnan(last_rpm) else "—")
-            kpi_col3.metric("Temp (°C)", f"{last_tmp:.1f}" if not math.isnan(last_tmp) else "—")
-            kpi_col4.metric("Fault windows (buffer)", faults)
+            k1.metric("Health", f"{100 - faults:.0f}%")
+            k2.metric("RPM", f"{recent_rpm[-1]:.0f}" if recent_rpm else "—")
+            k3.metric("Temp (°C)", f"{recent_temp[-1]:.1f}" if recent_temp else "—")
+            k4.metric("Fault Windows", faults)
 
-            plot_df = pd.DataFrame({"RMS": recent})
-            if recent_rpm is not None:  plot_df["RPM"] = recent_rpm
-            if recent_tmp is not None:  plot_df["Temp"] = recent_tmp
-            live_placeholder.line_chart(plot_df)
+            df_plot = pd.DataFrame({"RMS": recent})
+            if recent_rpm: df_plot["RPM"] = recent_rpm
+            if recent_temp: df_plot["Temp"] = recent_temp
+            chart_area.line_chart(df_plot)
 
-            meta_placeholder.caption(f"Δt={update_interval}ms • buffer={len(st.session_state.live_buffer)} • thr={thr:.4f} • last RMS={last_rms:.4f}")
-
-        time.sleep(update_interval/1000.0)
+        time.sleep(update_interval/1000)
         st.rerun()
 
     # ─────────────────────────────
-    # Mode: MQTT Live (x,y,z,rpm,temp)
+    # MODE MQTT
     # ─────────────────────────────
     if mode == "MQTT Live":
-        st.write("🌍 Connect to public MQTT broker (HiveMQ WebSocket).")
-        st.caption("Topic: `machine/vibration/data`  •  Payload: `{ \"x\":0.54, \"y\":0.49, \"z\":0.61, \"rpm\":1480, \"temp\":67.4 }`")
+        st.write("🌍 MQTT Live Telemetry Mode")
 
-        if not MQTT_OK:
-            st.error("Install MQTT:  `pip install paho-mqtt`")
-        else:
-            use_tls = st.toggle("Use secure WebSocket (wss)", value=True,
-                                help="Enable for Streamlit Cloud")
-            broker = "broker.hivemq.com"
-            port   = 8884 if use_tls else 8000
-            ws_path = "/mqtt"
-            topic  = "machine/vibration/data"
+        broker = "broker.hivemq.com"
+        topic = "machine/vibration/data"
 
-            def on_connect(client, userdata, flags, rc, properties=None):
-                if rc == 0:
-                    st.session_state.mqtt_connected = True
-                    client.subscribe(topic, qos=0)
-                else:
-                    st.session_state.mqtt_last_err = f"MQTT connect failed (rc={rc})"
+        def on_connect(client, userdata, flags, rc, props=None):
+            if rc == 0:
+                st.session_state.mqtt_connected = True
+                client.subscribe(topic)
+            else:
+                st.session_state.mqtt_last_err = f"Connect failed (rc={rc})"
 
-            # ⚠️ No Streamlit calls here
-            def on_message(client, userdata, msg):
-                try:
-                    j = json.loads(msg.payload.decode("utf-8"))
-                    x = float(j.get("x", 0))
-                    y = float(j.get("y", 0))
-                    z = float(j.get("z", 0))
-                    rpm = float(j.get("rpm")) if "rpm" in j else None
-                    temp = float(j.get("temp")) if "temp" in j else None
-                    push_sample_xyz(x, y, z, rpm=rpm, temp=temp)
-                except Exception:
-                    # ignore malformed payloads
-                    pass
+        def on_message(client, userdata, msg):
+            try:
+                j = json.loads(msg.payload.decode("utf-8"))
+                push_sample_data(j.get("x",0), j.get("y",0), j.get("z",0),
+                                 rpm=j.get("rpm"), temp=j.get("temp"))
+            except:
+                pass
 
-            ca, cb, cc = st.columns(3)
-            if ca.button("🔌 Connect"):
-                try:
-                    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets")
-                    client.ws_set_options(path=ws_path)
-                    if use_tls:
-                        import ssl
-                        client.tls_set(cert_reqs=ssl.CERT_NONE)
-                        client.tls_insecure_set(True)
-                    client.on_connect = on_connect
-                    client.on_message = on_message
-                    client.connect(broker, port, 60)
-                    client.loop_start()
-                    st.session_state.mqtt_client = client
-                except Exception as e:
-                    st.error(f"MQTT error: {e}")
+        if st.button("🔌 Connect MQTT"):
+            try:
+                client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets")
+                client.ws_set_options(path="/mqtt")
+                client.on_connect = on_connect
+                client.on_message = on_message
+                client.connect(broker, 8000, 60)
+                client.loop_start()
+                st.session_state.mqtt_client = client
+            except Exception as e:
+                st.error(str(e))
 
-            if cb.button("🔕 Disconnect"):
-                c = st.session_state.get("mqtt_client")
-                if c:
-                    c.loop_stop()
-                    c.disconnect()
-                st.session_state.mqtt_connected = False
+        recent = list(st.session_state.live_buffer)[-max_points:]
+        recent_rpm = list(st.session_state.live_rpm)[-max_points:]
+        recent_temp = list(st.session_state.live_temp)[-max_points:]
 
-            if cc.button("🧹 Clear Buffers"):
-                st.session_state.live_buffer.clear()
-                st.session_state.live_rpm.clear()
-                st.session_state.live_temp.clear()
+        if recent:
+            fused, dec, thr = score_live_window(np.array(recent))
+            faults = (dec == 1).sum() if len(dec) else 0
 
-            # connection status
-            if st.session_state.mqtt_connected:
-                kpi_col1.success("Connected")
-            if st.session_state.mqtt_last_err:
-                st.warning(st.session_state.mqtt_last_err)
+            k1.metric("Health", f"{100 - faults:.0f}%")
+            k2.metric("RPM", f"{recent_rpm[-1]:.0f}" if recent_rpm else "—")
+            k3.metric("Temp (°C)", f"{recent_temp[-1]:.1f}" if recent_temp else "—")
+            k4.metric("Fault Windows", faults)
 
-        # UI driven by buffer
-        recent = np.array(list(st.session_state.live_buffer)[-max_points:])
-        recent_rpm = np.array(list(st.session_state.live_rpm)[-max_points:]) if len(st.session_state.live_rpm) else None
-        recent_tmp = np.array(list(st.session_state.live_temp)[-max_points:]) if len(st.session_state.live_temp) else None
+            df_plot = pd.DataFrame({"RMS": recent})
+            if recent_rpm: df_plot["RPM"] = recent_rpm
+            if recent_temp: df_plot["Temp"] = recent_temp
+            chart_area.line_chart(df_plot)
 
-        if recent.size:
-            fused, dec, thr = score_live_window(model, recent)
-            faults = int((dec == 1).sum()) if dec.size else 0
-            last_rpm = float(recent_rpm[-1]) if recent_rpm is not None and recent_rpm.size else float("nan")
-            last_tmp = float(recent_tmp[-1]) if recent_tmp is not None and recent_tmp.size else float("nan")
-            last_fused = float(fused[-1]) if fused.size else 0.0
-            health = max(0.0, 100.0*(1.0 - (last_fused / (thr + 1e-9))))
-            health = float(np.clip(health, 0, 100))
-
-            kpi_col1.metric("Health Score", f"{health:.0f} %")
-            kpi_col2.metric("RPM", f"{last_rpm:.0f}" if not math.isnan(last_rpm) else "—")
-            kpi_col3.metric("Temp (°C)", f"{last_tmp:.1f}" if not math.isnan(last_tmp) else "—")
-            kpi_col4.metric("Fault windows (buffer)", faults)
-
-            plot_df = pd.DataFrame({"RMS": recent})
-            if recent_rpm is not None:  plot_df["RPM"] = recent_rpm
-            if recent_tmp is not None:  plot_df["Temp"] = recent_tmp
-            live_placeholder.line_chart(plot_df)
-
-            meta_placeholder.caption(
-                f"Δt={update_interval}ms • buffer={len(st.session_state.live_buffer)} • thr={thr:.4f}"
-            )
-
-        # throttle reruns so Cloud doesn’t freeze
-        time.sleep(update_interval/1000.0)
+        time.sleep(update_interval/1000)
         st.rerun()
-
 
 
 
