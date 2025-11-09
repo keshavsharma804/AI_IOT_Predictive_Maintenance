@@ -34,19 +34,24 @@ to detect early mechanical failures in rotating machines.
 # File Upload Section
 # -------------------------------
 st.header("📤 Upload Machine Sensor Data")
+
 uploaded_file = st.file_uploader(
-    "Upload CSV containing `vibration_rms` column",
+    "Upload CSV containing `vibration_rms` column (or leave empty to use demo data)",
     type=["csv"]
 )
 
-if uploaded_file is not None:
+# If no upload, auto-load demo sample
+if uploaded_file is None:
+    st.info("ℹ️ No file uploaded — using built-in demo dataset.")
+    data = pd.read_csv("data/synthetic/machine_001_data.csv")
+else:
     data = pd.read_csv(uploaded_file)
+    st.success("✅ Uploaded data loaded successfully!")
 
-    if "vibration_rms" not in data.columns:
-        st.error("❌ The uploaded file must contain a column named **vibration_rms**.")
-        st.stop()
-
-    st.success("✅ Data uploaded successfully!")
+# Validate required column
+if "vibration_rms" not in data.columns:
+    st.error("❌ The dataset must contain a column named **vibration_rms**.")
+    st.stop()
 
     # -------------------------------
     # Run Model Scoring
