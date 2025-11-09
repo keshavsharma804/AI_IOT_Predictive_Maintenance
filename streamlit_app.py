@@ -359,7 +359,7 @@ with tab_live:
             cols = st.columns(3)
             if cols[0].button("🔌 Connect"):
                 try:
-                    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+                    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets")
                     client.on_connect = on_connect
                     client.on_message = on_message
                     # Non-blocking loop
