@@ -5,7 +5,7 @@ import time
 from src.models.hybrid_ensemble import HybridEnsemble
 
 # Load saved hybrid model
-model = HybridEnsemble.load("models/saved_models/hybrid")
+model = HybridEnsemble.load(".models/saved_models/hybrid")
 
 st.title("🟢 Real-Time Machine Health Dashboard")
 
