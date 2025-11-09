@@ -54,49 +54,55 @@ class HybridEnsemble:
         return out[..., None]  # (N, seq_len, 1)
 
     # -------- Fit models --------
-   def fit(self, features_df: pd.DataFrame, raw_df: pd.DataFrame, signal_col: str = "vibration_rms"):
-        print("---- HYBRID TRAINING START ----")
+     def fit(self, features_df: pd.DataFrame, raw_df: pd.DataFrame, signal_col: str = "vibration_rms"):
+        print("\n---- HYBRID TRAINING START ----")
     
-        # 1) ===== Feature Preprocessing for Isolation Forest =====
-        print("Filtering non-numeric feature columns...")
-    
-        drop_cols = [
+        # ============================================================
+        # 1) CLEAN AND SELECT NUMERIC FEATURES ONLY
+        # ============================================================
+        bad_cols = [
             c for c in features_df.columns
-            if any(s in c.lower() for s in
-                   ["timestamp", "window", "machine", "failure", "severity", "label", "id"])
+            if any(key in c.lower() for key in ["timestamp", "window", "machine", "failure", "severity", "label", "id"])
         ]
-        features_df = features_df.drop(columns=drop_cols, errors="ignore")
+        features_df = features_df.drop(columns=bad_cols, errors="ignore")
     
+        # Keep **numeric only**
         features_df = features_df.select_dtypes(include=['float32','float64','int32','int64'])
+        
         if features_df.shape[1] == 0:
-            raise ValueError("❌ No numeric features available after filtering.")
-        print(f"✅ Using {features_df.shape[1]} numeric features for IF")
+            raise ValueError("❌ No usable numeric feature columns remain!")
     
+        print(f"✅ Using {features_df.shape[1]} numeric features for Isolation Forest")
+    
+        # Scale + train IF
         Xs = self.scaler.fit_transform(features_df)
         self.if_model.fit(Xs)
     
         if_scores = -self.if_model.decision_function(Xs)
         self.if_score_threshold = float(np.percentile(if_scores, 95))
     
-        # 2) ===== LSTM Autoencoder Training =====
-        print("Preparing raw signal for LSTM Autoencoder...")
-    
+        # ============================================================
+        # 2) PREP RAW SIGNAL FOR LSTM AUTOENCODER
+        # ============================================================
         if signal_col not in raw_df.columns:
-            raise ValueError(f"❌ Raw data missing signal column: {signal_col}")
+            raise ValueError(f"❌ Raw data does not contain signal column: {signal_col}")
     
-        sig = raw_df[signal_col].astype(float).values
-        seqs = self._make_sequences(sig, self.seq_len)
+        signal = raw_df[signal_col].astype(float).values
+        seqs = self._make_sequences(signal, self.seq_len)
     
         if len(seqs) == 0:
-            raise ValueError("❌ Not enough raw samples to form sequences. Reduce --seq-len.")
+            raise ValueError("❌ Not enough raw data to form LSTM sequences. Reduce seq_len.")
     
-        print(f"✅ Created {seqs.shape[0]} training sequences for LSTM AE")
+        print(f"✅ Created {seqs.shape[0]} sequences for LSTM-AE training")
     
+        # Build + Train LSTM Autoencoder
         self.lstm = self._build_lstm_autoencoder(self.seq_len)
-        self.lstm.fit(seqs, seqs,
-                      epochs=self.lstm_epochs,
-                      batch_size=self.lstm_batch,
-                      verbose=1)
+        self.lstm.fit(
+            seqs, seqs,
+            epochs=self.lstm_epochs,
+            batch_size=self.lstm_batch,
+            verbose=1
+        )
     
         print("✅ HYBRID MODEL TRAINING COMPLETE\n")
 
