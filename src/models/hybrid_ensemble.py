@@ -55,67 +55,49 @@ class HybridEnsemble:
 
     # -------- Fit models --------
     def fit(self, features_df: pd.DataFrame, raw_df: pd.DataFrame, signal_col: str = "vibration_rms"):
-        # -------- Isolation Forest on features --------
-        # -------- Isolation Forest on feature table --------
-        non_numeric = {"timestamp", "window_start", "window_end", "machine_id", "failure_type", "severity", "label"}
-        
-        # Drop metadata / non-numeric columns
-        feat_df = features_df.drop(columns=[c for c in features_df.columns if c in non_numeric], errors='ignore')
-        
-        # Keep numeric columns only
-        feat_df = feat_df.select_dtypes(include=['float32', 'float64', 'int32', 'int64'])
-        
-        if feat_df.shape[1] == 0:
-            raise ValueError("No numeric features available for model training.")
-        
+        self.logger.info("Preparing features for Isolation Forest...")
+    
+        # Drop non-numeric / metadata columns
+        features_df = features_df.drop(columns=[
+            c for c in features_df.columns
+            if any(x in c.lower() for x in 
+                   ["timestamp", "window", "machine", "failure", "severity", "label"])
+        ], errors='ignore')
+    
+        # Select only numeric columns
+        features_df = features_df.select_dtypes(include=['float32','float64','int32','int64'])
+    
+        if features_df.shape[1] == 0:
+            raise ValueError("❌ No numeric features found after filtering!")
+    
+        self.logger.info(f"✅ Numeric feature count: {features_df.shape[1]}")
+    
         # Scale numeric features
-        Xs = self.scaler.fit_transform(feat_df.values)
-        
+        Xs = self.scaler.fit_transform(features_df)
+    
         # Train Isolation Forest
         self.if_model.fit(Xs)
-        
-        # Compute anomaly score threshold
+    
+        # Compute anomaly threshold
         if_scores = -self.if_model.decision_function(Xs)
         self.if_score_threshold = float(np.percentile(if_scores, 95.0))
-
-
-        # Choose IF threshold ~ 95th percentile of scores on train normal
-        if_scores = -self.if_model.decision_function(Xs)  # higher = more anomalous
-        self.if_score_threshold = float(np.percentile(if_scores, 95.0))
-
-        # -------- LSTM-AE on sequences of raw signal --------
+    
+        # ---------------- LSTM PART ----------------
+        self.logger.info("Preparing raw signal for LSTM Autoencoder...")
+    
         if signal_col not in raw_df.columns:
-            raise ValueError(f"Signal column '{signal_col}' not found in raw data.")
+            raise ValueError(f"Signal column '{signal_col}' not found in raw data")
+    
         signal = raw_df[signal_col].astype(float).values
         seqs = self._make_sequences(signal, self.seq_len)
+    
         if len(seqs) == 0:
-            raise ValueError("Not enough raw samples to form LSTM sequences. Reduce seq_len.")
+            raise ValueError("❌ Not enough raw samples to form sequences. Reduce --seq-len.")
+    
+        self.lstm_model.fit(seqs)
+    
+        self.logger.info("✅ Hybrid Model Training Complete")
 
-        # Treat entire raw as mostly-normal for self-supervised AE; remove extreme outliers
-        s_med, s_iqr = np.median(signal), np.subtract(*np.percentile(signal, [75, 25]))
-        keep = (signal > s_med - 3*s_iqr) & (signal < s_med + 3*s_iqr)
-        if keep.sum() > self.seq_len:
-            signal_f = signal[keep]
-            seqs = self._make_sequences(signal_f, self.seq_len)
-
-        # Train/val split for thresholding
-        idx = np.arange(len(seqs))
-        tr_idx, va_idx = train_test_split(idx, test_size=0.2, random_state=42, shuffle=True)
-        x_tr, x_va = seqs[tr_idx], seqs[va_idx]
-
-        self.lstm = self._build_lstm_autoencoder(self.seq_len)
-        cb = [keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True)]
-        self.lstm.fit(x_tr, x_tr,
-                      validation_data=(x_va, x_va),
-                      epochs=self.lstm_epochs,
-                      batch_size=self.lstm_batch,
-                      verbose=1,
-                      callbacks=cb)
-
-        # Reconstruction error distribution on validation → threshold at 97.5th percentile
-        va_pred = self.lstm.predict(x_va, verbose=0)
-        va_err = np.mean(np.abs(va_pred - x_va), axis=(1,2))
-        self.recon_threshold = float(np.percentile(va_err, 97.5))
 
     # -------- Scoring --------
     def score_features(self, features_df: pd.DataFrame):
