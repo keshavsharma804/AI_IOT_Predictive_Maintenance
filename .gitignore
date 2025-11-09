@@ -28,8 +28,8 @@ data/synthetic/*
 !data/.gitkeep
 
 # Models
-models/saved_models/*
-!models/.gitkeep
+!models/saved_models/**
+
 
 # Results
 results/figures/*
