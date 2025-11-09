@@ -19,6 +19,7 @@ prophet>=1.1.4
 # Visualization
 matplotlib>=3.7.0
 seaborn>=0.12.0
+paho-mqtt
 
 # Explainability
 shap>=0.42.0
