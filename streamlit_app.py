@@ -1,167 +1,106 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from pathlib import Path
-from scipy.signal import butter, filtfilt
-from scipy.stats import kurtosis, skew
 import matplotlib.pyplot as plt
-import seaborn as sns
+from pathlib import Path
 from src.models.hybrid_ensemble import HybridEnsemble
 
-# -----------------------------------
-# Page config
-# -----------------------------------
-st.set_page_config(
-    page_title="Predictive Maintenance Dashboard",
-    page_icon="🛠️",
-    layout="wide"
-)
+st.set_page_config(page_title="Predictive Maintenance Dashboard", page_icon="🛠️", layout="wide")
 
 ROOT = Path(".")
 MODEL_DIR = ROOT / "models" / "saved_models" / "hybrid"
 DEMO_CSV = ROOT / "data" / "synthetic" / "machine_001_demo.csv"
 
-# -----------------------------------
-# Utilities
-# -----------------------------------
-def ensure_exists(p: Path) -> bool:
-    try: return p.exists()
-    except: return False
 
 @st.cache_resource
 def load_model():
-    required = ["if_model.pkl", "lstm_ae.keras", "scaler.pkl", "meta.json"]
-    missing = [f for f in required if not ensure_exists(MODEL_DIR / f)]
-    if missing:
-        st.error("❌ Model artifacts missing in models/saved_models/hybrid/")
-        st.stop()
     return HybridEnsemble.load(MODEL_DIR.as_posix())
 
-def load_demo_data():
-    if ensure_exists(DEMO_CSV):
-        return pd.read_csv(DEMO_CSV)
-    # Auto-synthetic fallback dataset
-    t = np.arange(4000) / 200.0
-    vib = 0.5 + 0.05*np.sin(2*np.pi*3*t) + 0.02*np.random.randn(len(t))
-    vib[2000:2100] += 0.25*np.sin(2*np.pi*15*t[2000:2100])
-    return pd.DataFrame({"vibration_rms": vib})
 
-def butter_lowpass_filter(x, cutoff=50, fs=1000, order=4):
-    b, a = butter(order, cutoff/(0.5*fs), btype="low")
-    return filtfilt(b, a, x)
+@st.cache_data
+def load_demo():
+    return pd.read_csv(DEMO_CSV)
 
-def fuse_scores(if_scores, lstm_scores):
-    try:
-        return model.combine_scores(if_scores, lstm_scores)
-    except:
-        m = min(len(if_scores), len(lstm_scores))
-        return 0.5 * if_scores[:m] + 0.5 * lstm_scores[:m]
 
-def make_decisions(fused, baseline=2000, pctl=99.0):
-    thr = np.percentile(fused[:min(baseline, len(fused))], pctl)
-    return (fused >= thr).astype(int)
+@st.cache_data
+def score_data(df):
+    lstm_scores = model.score_sequences(df, signal_col="vibration_rms")
+    if_scores = np.zeros_like(lstm_scores)
+    # fused = model.combine_scores(if_scores, lstm_scores)
+    m = min(len(if_scores), len(lstm_scores))
+    fused = 0.5 * if_scores[:m] + 0.5 * lstm_scores[:m]
+    thr = np.percentile(fused[:min(2000, len(fused))], 99)
+    decisions = (fused >= thr).astype(int)
+    return fused, decisions
 
-# -----------------------------------
-# Load model
-# -----------------------------------
+
+def plot_scores(fused, decisions):
+    downsample = max(len(fused) // 500, 1)
+    fused_ds = fused[::downsample]
+    decisions_ds = decisions[::downsample]
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(fused_ds, label="Anomaly Score")
+    ax.scatter(np.where(decisions_ds == 1), fused_ds[decisions_ds == 1], color='red', s=12, label="Fault")
+    ax.set_title("Anomaly Score Trend")
+    ax.set_xlabel("Time / Window Index")
+    ax.set_ylabel("Score")
+    ax.legend()
+    st.pyplot(fig)
+
+
+# ---------------- UI ----------------
 model = load_model()
 
-# -----------------------------------
-# UI Header
-# -----------------------------------
 st.title("🛠️ AI-Based Predictive Maintenance Dashboard")
-st.write("""
-This dashboard analyzes **vibration sensor data** to detect **early machine faults**, using:
 
-- 🧠 *LSTM Autoencoder* → Learns normal vibration behavior  
-- 🌲 *Isolation Forest* → Detects statistical anomalies  
+st.write("""
+This dashboard uses a **Hybrid AI Model** combining:
+- **LSTM Autoencoder** (sequence reconstruction)
+- **Isolation Forest** (feature anomaly)
+
+to detect **early machinery faults** from vibration signals.
 """)
 
-# Upload Section
-st.header("📤 Upload Machine Sensor Data")
-uploaded = st.file_uploader("Upload CSV (supports vibration X/Y/Z, temperature, acoustic)", type=["csv"])
+uploaded = st.file_uploader("Upload CSV (must contain `vibration_rms`)", type="csv")
 
 if uploaded:
-    data = pd.read_csv(uploaded)
-    st.success("✅ File loaded successfully!")
+    try:
+        data = pd.read_csv(uploaded)
+        st.success("✅ File uploaded successfully!")
+    except:
+        st.error("❌ Could not read the file.")
+        st.stop()
 else:
-    st.info("ℹ️ Using demo dataset.")
-    data = load_demo_data()
+    st.info("ℹ️ Using demo dataset")
+    data = load_demo()
 
 if "vibration_rms" not in data.columns:
-    st.error("Dataset must contain a `vibration_rms` column.")
+    st.error("❌ Required column `vibration_rms` missing.")
     st.stop()
 
-# -----------------------------------
-# Raw Signal Visualization
-# -----------------------------------
-st.subheader("📊 Raw Sensor Signal(s)")
-possible_signals = [c for c in data.columns if c not in ["timestamp"]]
-selected_signals = st.multiselect("Select signals to visualize:", possible_signals, default=["vibration_rms"])
-if selected_signals:
-    st.line_chart(data[selected_signals])
+with st.spinner("Running anomaly detection..."):
+    fused, decisions = score_data(data)
 
-# -----------------------------------
-# Filtering & FFT
-# -----------------------------------
-st.subheader("🔧 Filtered Signal (Noise Reduction)")
-data["filtered"] = butter_lowpass_filter(data["vibration_rms"])
-st.line_chart(data[["vibration_rms","filtered"]])
+# ---- Metrics ----
+col1, col2, col3 = st.columns(3)
+col1.metric("Total Samples", len(data))
+col2.metric("Windows Scored", len(fused))
+col3.metric("Faults Detected", int((decisions == 1).sum()))
 
-st.subheader("⚡ Frequency Spectrum (FFT)")
-signal = data["vibration_rms"].values
-freq = np.fft.rfftfreq(len(signal), 1/1000)
-amp = np.abs(np.fft.rfft(signal))
-st.line_chart(pd.DataFrame({"Amplitude": amp}, index=freq))
+# ---- Chart ----
+st.subheader("📈 Machine Condition Over Time")
+plot_scores(fused, decisions)
 
-# -----------------------------------
-# Feature Extraction
-# -----------------------------------
-st.subheader("📐 Extracted Signal Features")
-features = pd.DataFrame({
-    "RMS": [np.sqrt(np.mean(signal**2))],
-    "Peak": [np.max(np.abs(signal))],
-    "Kurtosis": [kurtosis(signal)],
-    "Skewness": [skew(signal)]
+# ---- Results Table Download ----
+results_df = pd.DataFrame({
+    "index": np.arange(len(fused)),
+    "fused_score": fused,
+    "label": decisions
 })
-st.table(features)
 
-# -----------------------------------
-# Run LSTM Model
-# -----------------------------------
-st.subheader("🔍 Running Anomaly Detection...")
-lstm_scores = model.score_sequences(data, "vibration_rms")
-if_scores = np.zeros_like(lstm_scores)
-fused = fuse_scores(if_scores, lstm_scores)
-decisions = make_decisions(fused)
+st.download_button("Download Results as CSV", results_df.to_csv(index=False), "predictions.csv", "text/csv")
 
-# Metrics
-st.metric("Samples Processed", len(data))
-st.metric("Faulty Windows", int(decisions.sum()))
-
-# -----------------------------------
-# LSTM Reconstruction Visualization
-# -----------------------------------
-st.subheader("🧠 LSTM Reconstruction Comparison")
-try:
-    reconstructed = model.reconstruct_sequences(data, "vibration_rms")
-    comp = pd.DataFrame({"Original": data["vibration_rms"][:len(reconstructed)],
-                         "Reconstructed": reconstructed})
-    st.line_chart(comp)
-except:
-    st.info("Reconstruction visualization is not available for this model.")
-
-# -----------------------------------
-# Fault Heatmap
-# -----------------------------------
-st.subheader("🔥 Fault Heatmap")
-fig, ax = plt.subplots(figsize=(12,2))
-sns.heatmap([fused], cmap="coolwarm", ax=ax)
-st.pyplot(fig)
-
-# -----------------------------------
-# Download Results
-# -----------------------------------
-st.download_button("⬇️ Download Predictions CSV", 
-                   results_df := pd.DataFrame({"fused_score": fused, "label": decisions}).to_csv(index=False),
-                   "predictions.csv", "text/csv")
+with st.sidebar:
+    st.header("About")
+    st.write("This system detects early machine faults using hybrid AI (LSTM + Isolation Forest).")
