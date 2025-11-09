@@ -88,20 +88,29 @@ def make_decisions(fused: np.ndarray, baseline: int = 2000, pctl: float = 99.0) 
     if len(fused) == 0:
         return np.array([], dtype=int)
     thr = np.percentile(fused[:min(baseline, len(fused))], pctl)
-    return (fused >= thr).astype(int), float(thr)
+    return (fused >= thr).astype(int)
 
-@st.cache_data(hash_funcs={pd.DataFrame: lambda _: None})
+@st.cache_data(
+    hash_funcs={
+        pd.DataFrame: lambda _: None,
+        HybridEnsemble: lambda _: None,  # CRITICAL FIX
+    }
+)
 def score_offline(model: HybridEnsemble, df: pd.DataFrame) -> dict:
     lstm_scores = model.score_sequences(df, signal_col="vibration_rms")
     if_scores = np.zeros_like(lstm_scores)
-    fused = fuse_scores(model, if_scores, lstm_scores)
-    decisions, thr = make_decisions(fused, baseline=2000, pctl=99.0)
+    fused = fuse_scores(if_scores, lstm_scores)
+
+    base = min(2000, len(fused))
+    thr = np.percentile(fused[:base], 99)
+    decisions = (fused >= thr).astype(int)
+
     return {
         "lstm_scores": lstm_scores,
         "if_scores": if_scores,
         "fused": fused,
         "decisions": decisions,
-        "threshold": thr,
+        "threshold": float(thr)
     }
 
 def compute_features(sig: np.ndarray) -> pd.DataFrame:
