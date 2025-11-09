@@ -47,7 +47,7 @@ uploaded_file = st.file_uploader(
 if uploaded_file is None:
     st.info("ℹ️ No file uploaded — using demo dataset.")
     try:
-        data = pd.read_csv("./data/synthetic/machine_001_data.csv")
+        data = pd.read_csv("data/synthetic/machine_001_demo.csv")
     except:
         st.error("❌ Demo dataset is missing. Please upload a CSV file.")
         st.stop()
