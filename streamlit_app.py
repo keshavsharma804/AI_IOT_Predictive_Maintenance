@@ -99,7 +99,7 @@ def make_decisions(fused: np.ndarray, baseline: int = 2000, pctl: float = 99.0) 
 def score_offline(model: HybridEnsemble, df: pd.DataFrame) -> dict:
     lstm_scores = model.score_sequences(df, signal_col="vibration_rms")
     if_scores = np.zeros_like(lstm_scores)
-    fused = fuse_scores(if_scores, lstm_scores)
+    fused = fuse_scores(model, if_scores, lstm_scores)
 
     base = min(2000, len(fused))
     thr = np.percentile(fused[:base], 99)
