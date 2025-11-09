@@ -318,8 +318,13 @@ with tab_live:
     def push_sample_data(x, y, z, rpm=None, temp=None):
         rms = math.sqrt((x*x + y*y + z*z) / 3.0)
         st.session_state.live_buffer.append(rms)
-        if rpm is not None: st.session_state.live_rpm.append(float(rpm))
-        if temp is not None: st.session_state.live_temp.append(float(temp))
+    
+        if rpm is not None:
+            st.session_state.live_rpm.append(float(rpm))
+    
+        if temp is not None:
+            st.session_state.live_temp.append(float(temp))
+
 
     # ─────────────────────────────
     # MODE A2 - Simulated Stream
