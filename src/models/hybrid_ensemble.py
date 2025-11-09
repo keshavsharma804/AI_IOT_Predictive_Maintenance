@@ -54,7 +54,7 @@ class HybridEnsemble:
         return out[..., None]  # (N, seq_len, 1)
 
     # -------- Fit models --------
-         def fit(self, features_df: pd.DataFrame, raw_df: pd.DataFrame, signal_col: str = "vibration_rms"):
+    def fit(self, features_df: pd.DataFrame, raw_df: pd.DataFrame, signal_col: str = "vibration_rms"):
         # --------- PREPARE FEATURES FOR ISOLATION FOREST ---------
         # Drop non-numeric / metadata columns
         features_df = features_df.drop(columns=[
