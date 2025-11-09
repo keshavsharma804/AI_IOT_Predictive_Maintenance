@@ -346,7 +346,7 @@ with tab_live:
 
         if st.session_state.live_running:
             if "sim_idx" not in st.session_state: st.session_state.sim_idx = 0
-            for i in range(st.session_state.sim_idx, st.session_state.sim_idx + sim_rate:
+            for i in range(st.session_state.sim_idx, st.session_state.sim_idx + sim_rate):
                 j = i % len(xs)
                 push_sample_data(xs[j], ys[j], zs[j],
                                  rpm=1500 + 20*np.sin(j/200),
