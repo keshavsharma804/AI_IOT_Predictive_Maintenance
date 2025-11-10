@@ -539,19 +539,33 @@ with tab_live:
         st.pyplot(fig)
 
         # Feature tabs without retraining
+        # ---- Feature Computation Block ----
         if sensor_choice == "Time Domain Features":
-            from scipy.stats import kurtosis as _kurt, skew as _skew if SCIPY_OK else (lambda x: np.nan, lambda x: np.nan)
+            if SCIPY_OK:
+                from scipy.stats import kurtosis as _kurt, skew as _skew
+                krt = float(_kurt(series))
+                skw = float(_skew(series))
+            else:
+                krt = float("nan")
+                skw = float("nan")
+        
             rms = float(np.sqrt(np.mean(series**2)))
             peak = float(np.max(np.abs(series)))
-            krt = float(_kurt(series)) if SCIPY_OK else float("nan")
-            skw = float(_skew(series)) if SCIPY_OK else float("nan")
-            st.table(pd.DataFrame({"RMS":[rms], "Peak":[peak], "Kurtosis":[krt], "Skewness":[skw]}))
+        
+            st.table(pd.DataFrame({
+                "RMS": [rms],
+                "Peak": [peak],
+                "Kurtosis": [krt],
+                "Skewness": [skw]
+            }))
+
 
         if sensor_choice == "Frequency Domain Features":
             fft = np.abs(np.fft.rfft(series))
-            freq = np.fft.rfftfreq(series.size, d=1.0)  # unknown fs; relative
+            freq = np.fft.rfftfreq(series.size, d=1.0)
             df_fft = pd.DataFrame({"Amplitude": fft}, index=freq)
             st.line_chart(df_fft.head(min(len(df_fft), 2000)))
+
     else:
         st.info("Waiting for data…")
 
