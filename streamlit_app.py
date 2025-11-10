@@ -341,19 +341,47 @@ with tab_live:
         st.caption("🌍 Broker: broker.hivemq.com  |  Topic: machine/vibration/data")
 
         def create_client():
-            client = mqtt.Client()
-            client.on_message = lambda c,u,m: st.session_state.message_queue.put(json.loads(m.payload))
+            def on_connect(client, userdata, flags, rc):
+                if rc == 0:
+                    st.session_state.mqtt_connected = True
+                    client.subscribe("machine/vibration/data", qos=0)
+                else:
+                    st.session_state.mqtt_last_err = f"Failed to connect (rc={rc})"
+        
+            def on_message(client, userdata, msg):
+                try:
+                    payload = json.loads(msg.payload.decode("utf-8"))
+                    st.session_state.message_queue.put(payload)   # ✅ push to queue
+                except:
+                    pass
+        
+            # ✅ Use TCP, not websockets
+            try:
+                client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+            except:
+                client = mqtt.Client()
+        
+            client.on_connect = on_connect
+            client.on_message = on_message
+        
+            # ✅ Correct TCP port
             client.connect("broker.hivemq.com", 1883, 60)
-            client.subscribe("machine/vibration/data")
             client.loop_start()
             return client
+        
+        
+        if mode == "MQTT Live":
+            if st.button("🔌 Connect", disabled=st.session_state.mqtt_connected):
+                st.session_state.mqtt_client = create_client()
+                st.session_state.mqtt_connected = True
+        
+            if st.button("🔕 Disconnect", disabled=not st.session_state.mqtt_connected):
+                c = st.session_state.get("mqtt_client")
+                if c:
+                    c.loop_stop()
+                    c.disconnect()
+                st.session_state.mqtt_connected = False
 
-        if not st.session_state.mqtt_connected and st.button("🔌 Connect"):
-            st.session_state.mqtt_client = create_client()
-            st.session_state.mqtt_connected = True
-
-        if st.session_state.mqtt_connected:
-            st.success("✅ Connected (Receiving)")
 
     # ---- Refresh UI ----
     processed = process_message_queue()
