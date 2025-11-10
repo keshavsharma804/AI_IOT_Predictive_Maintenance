@@ -1,13 +1,14 @@
-import json, time, math
+# streamlit_app.py
+import json, time, math, queue
 from collections import deque
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
-# Optional imports (graceful fallback if not present)
+# Optional imports
 try:
     from scipy.signal import butter, filtfilt
     from scipy.stats import kurtosis, skew
@@ -15,27 +16,31 @@ try:
 except Exception:
     SCIPY_OK = False
 
-# MQTT optional
 MQTT_OK = True
 try:
     import paho.mqtt.client as mqtt
 except Exception:
     MQTT_OK = False
 
-from src.models.hybrid_ensemble import HybridEnsemble
+# ===== If you have these, keep them; otherwise comment them out =====
+try:
+    from src.models.hybrid_ensemble import HybridEnsemble
+    HAS_MODEL = True
+except Exception:
+    HAS_MODEL = False
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # Page config
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Predictive Maintenance Dashboard", page_icon="🛠️", layout="wide")
 
 ROOT = Path(".")
 MODEL_DIR = ROOT / "models" / "saved_models" / "hybrid"
 DEMO_CSV = ROOT / "data" / "synthetic" / "machine_001_demo.csv"
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 # Utilities
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
 def ensure_exists(p: Path) -> bool:
     try:
         return p.exists()
@@ -44,36 +49,32 @@ def ensure_exists(p: Path) -> bool:
 
 @st.cache_resource
 def load_model():
+    if not HAS_MODEL:
+        return None
     required = ["if_model.pkl", "lstm_ae.keras", "scaler.pkl", "meta.json"]
     missing = [f for f in required if not ensure_exists(MODEL_DIR / f)]
     if missing:
-        st.error(
-            "❌ Trained model files missing in `models/saved_models/hybrid/`:\n" +
-            "\n".join(f"- {f}" for f in required)
-        )
-        st.stop()
+        st.warning("Model files missing; running without live anomaly scoring.")
+        return None
     return HybridEnsemble.load(MODEL_DIR.as_posix())
 
 @st.cache_data
 def load_demo_dataframe() -> pd.DataFrame:
     if ensure_exists(DEMO_CSV):
         return pd.read_csv(DEMO_CSV)
-    # Tiny synthetic fallback (always available)
+    # tiny synthetic fallback
     n = 5000
     t = np.arange(n) / 200.0
-    # synthetic 3-axis with subtle differences
     x = 0.5 + 0.05*np.sin(2*np.pi*3*t) + 0.02*np.random.randn(n)
     y = 0.5 + 0.04*np.sin(2*np.pi*3.2*t + 0.3) + 0.02*np.random.randn(n)
     z = 0.5 + 0.06*np.sin(2*np.pi*2.8*t - 0.2) + 0.02*np.random.randn(n)
-    # inject anomaly burst
     z[2000:2100] += 0.25*np.sin(2*np.pi*15*t[2000:2100])
     df = pd.DataFrame({"x": x, "y": y, "z": z})
     df["vibration_rms"] = np.sqrt((df["x"]**2 + df["y"]**2 + df["z"]**2)/3.0)
     return df
 
 def lowpass(x, cutoff=50, fs=1000, order=4):
-    if not SCIPY_OK:
-        return x  # fallback: no filtering
+    if not SCIPY_OK: return x
     b, a = butter(order, cutoff/(0.5*fs), btype="low")
     return filtfilt(b, a, x)
 
@@ -84,34 +85,17 @@ def fuse_scores(model, if_scores: np.ndarray, lstm_scores: np.ndarray) -> np.nda
         m = min(len(if_scores), len(lstm_scores))
         return 0.5 * if_scores[:m] + 0.5 * lstm_scores[:m]
 
-def make_decisions(fused: np.ndarray, baseline: int = 2000, pctl: float = 99.0) -> np.ndarray:
-    if len(fused) == 0:
-        return np.array([], dtype=int)
-    thr = np.percentile(fused[:min(baseline, len(fused))], pctl)
-    return (fused >= thr).astype(int)
-
-@st.cache_data(
-    hash_funcs={
-        pd.DataFrame: lambda _: None,
-        HybridEnsemble: lambda _: None,  # CRITICAL FIX
-    }
-)
-def score_offline(model: HybridEnsemble, df: pd.DataFrame) -> dict:
+def score_offline(model, df: pd.DataFrame) -> dict:
+    if model is None:
+        fused = np.zeros(len(df))
+        return {"lstm_scores": fused, "if_scores": fused, "fused": fused, "decisions": np.zeros(len(fused)), "threshold": 0.0}
     lstm_scores = model.score_sequences(df, signal_col="vibration_rms")
     if_scores = np.zeros_like(lstm_scores)
     fused = fuse_scores(model, if_scores, lstm_scores)
-
     base = min(2000, len(fused))
     thr = np.percentile(fused[:base], 99)
     decisions = (fused >= thr).astype(int)
-
-    return {
-        "lstm_scores": lstm_scores,
-        "if_scores": if_scores,
-        "fused": fused,
-        "decisions": decisions,
-        "threshold": float(thr)
-    }
+    return {"lstm_scores": lstm_scores, "if_scores": if_scores, "fused": fused, "decisions": decisions, "threshold": float(thr)}
 
 def compute_features(sig: np.ndarray) -> pd.DataFrame:
     rms = float(np.sqrt(np.mean(sig**2)))
@@ -120,44 +104,52 @@ def compute_features(sig: np.ndarray) -> pd.DataFrame:
     skw = float(skew(sig)) if SCIPY_OK else float("nan")
     return pd.DataFrame({"RMS":[rms], "Peak":[peak], "Kurtosis":[krt], "Skewness":[skw]})
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Session state for Live modes
-# ────────────────────────────────────────────────────────────────────────────────
+def score_live_window(arr: np.ndarray, model):
+    if model is None or arr.size < 32:
+        return np.array([]), np.array([]), 0.0
+    df = pd.DataFrame({"vibration_rms": arr})
+    try:
+        lstm = model.score_sequences(df, "vibration_rms")
+        ifs = np.zeros_like(lstm)
+        fused = fuse_scores(model, ifs, lstm)
+        thr = float(np.percentile(fused[:min(200, len(fused))], 99))
+        dec = (fused >= thr).astype(int)
+        return fused, dec, thr
+    except Exception:
+        # fail-safe
+        return np.array([]), np.array([]), 0.0
+
+# ────────────────────────────────────────────────────────────────────
+# Session State (init first!)
+# ────────────────────────────────────────────────────────────────────
+if "message_queue" not in st.session_state:
+    st.session_state.message_queue = queue.Queue()
+
 if "live_buffer" not in st.session_state:
-    st.session_state.live_buffer = deque(maxlen=6000)   # vibration RMS
+    st.session_state.live_buffer = deque(maxlen=6000)  # RMS
 
-if "live_rpm" not in st.session_state:
-    st.session_state.live_rpm = deque(maxlen=6000)      # RPM / speed
+for k in ("vibration_x","vibration_y","vibration_z","live_rpm","live_temp"):
+    if k not in st.session_state:
+        st.session_state[k] = deque(maxlen=6000)
 
-if "live_temp" not in st.session_state:
-    st.session_state.live_temp = deque(maxlen=6000)     # Temperature
-
-if "live_running" not in st.session_state:
-    st.session_state.live_running = False
-
-if "mqtt_connected" not in st.session_state:
-    st.session_state.mqtt_connected = False
-
-if "mqtt_last_err" not in st.session_state:
-    st.session_state.mqtt_last_err = ""
+for k in ("live_running","mqtt_connected","mqtt_last_err"):
+    if k not in st.session_state:
+        st.session_state[k] = False if k != "mqtt_last_err" else ""
 
 if "asset_name" not in st.session_state:
     st.session_state.asset_name = "Motor-001"
 
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Load model & data source selection
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# Load model
+# ────────────────────────────────────────────────────────────────────
 model = load_model()
 
+# ────────────────────────────────────────────────────────────────────
+# Sidebar
+# ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("📦 Data Source")
-    source = st.radio(
-        "Choose input",
-        ["Upload / CSV", "Demo (static)", "Simulated Stream (A2)", "MQTT Live"],
-        index=1,
-        help="Switches the dashboard between offline analysis and live modes."
-    )
+    source = st.radio("Choose input", ["Upload / CSV", "Demo (static)", "Simulated Stream", "MQTT Live"], index=1)
     st.text_input("Asset Name", value=st.session_state.asset_name, key="asset_name")
 
     st.divider()
@@ -165,56 +157,40 @@ with st.sidebar:
     max_points = st.slider("Max chart points (downsample)", 200, 4000, 800, 100)
     update_interval = st.slider("Live update (ms)", 100, 1500, 400, 50)
 
-    st.divider()
-    if not SCIPY_OK:
-        st.warning("`scipy` not available → filtering/feature kurtosis/skew use fallbacks.", icon="⚠️")
-    if not MQTT_OK:
-        st.info("Install `paho-mqtt` to enable MQTT live mode.", icon="ℹ️")
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Tabs keep your earlier sections but compute on demand (faster)
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# Tabs
+# ────────────────────────────────────────────────────────────────────
 tab_overview, tab_signals, tab_freq, tab_features, tab_anom, tab_live, tab_admin = st.tabs(
     ["Overview", "Signals", "Filters & FFT", "Features", "Anomalies", "Live", "Admin"]
 )
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Source: Upload / Demo (offline analysis)
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# Offline modes (keep your structure)
+# ────────────────────────────────────────────────────────────────────
 if source in ["Upload / CSV", "Demo (static)"]:
     with tab_overview:
         st.title("🛠️ AI-Based Predictive Maintenance Dashboard")
-        st.write("""
-**Hybrid Ensemble:** LSTM Autoencoder (sequence) + Isolation Forest (feature)  
-Detects **early faults** in rotating machinery from vibration signals.
-""")
+        st.write("**Hybrid Ensemble:** LSTM Autoencoder (sequence) + Isolation Forest (feature)")
 
         if source == "Upload / CSV":
             up = st.file_uploader("Upload CSV containing `vibration_rms` or axes x,y,z", type=["csv"])
-            if up is None:
-                st.stop()
+            if up is None: st.stop()
             df = pd.read_csv(up)
         else:
             df = load_demo_dataframe()
 
-        # Accept x,y,z too → compute vibration_rms
         if "vibration_rms" not in df.columns:
-            axes = {"x","y","z"}
-            if axes.issubset(df.columns):
+            if {"x","y","z"}.issubset(df.columns):
                 df["vibration_rms"] = np.sqrt((df["x"]**2 + df["y"]**2 + df["z"]**2)/3.0)
             else:
-                st.error("❌ Provide `vibration_rms` or columns `x,y,z`.")
-                st.stop()
+                st.error("❌ Provide `vibration_rms` or columns `x,y,z`."); st.stop()
 
-        with st.spinner("Scoring with LSTM…"):
-            out = score_offline(model, df)
-
+        out = score_offline(model, df)
         c1,c2,c3 = st.columns(3)
         c1.metric("Samples", len(df))
         c2.metric("Windows Scored", int(len(out["fused"])))
         c3.metric("Fault Windows", int((out["decisions"]==1).sum()))
 
-        # Anomaly trend (downsampled)
         step = max(1, len(out["fused"]) // max_points)
         fused_view = out["fused"][::step]
         st.subheader("📈 Anomaly Score Timeline")
@@ -264,317 +240,206 @@ Detects **early faults** in rotating machinery from vibration signals.
             st.error(f"⚠️ {len(fault_idx)} fault windows detected.")
             st.write(f"First 50 fault windows: {fault_idx[:50].tolist()}")
 
-        # Heatmap (lightweight)
-        fig, ax = plt.subplots(figsize=(12, 2))
-        ax.imshow(fused[np.newaxis, :], aspect="auto", cmap="coolwarm")
-        ax.set_yticks([])
-        ax.set_xlabel("Window Index")
-        ax.set_title("Fault Heatmap")
-        st.pyplot(fig)
-
-        # Download
-        res = pd.DataFrame({
-            "index": np.arange(len(fused)),
-            "lstm_score": out["lstm_scores"][:len(fused)],
-            "if_score": out["if_scores"][:len(fused)],
-            "fused_score": fused,
-            "label": decisions
-        })
-        st.download_button("⬇️ Download Predictions CSV", res.to_csv(index=False).encode("utf-8"),
-                           file_name="predictions.csv", mime="text/csv")
-
-# ────────────────────────────────────────────────────────────────────────────────
-# LIVE tab: Simulated Stream (A2) and MQTT  (REPLACE THIS WHOLE BLOCK)
-# ────────────────────────────────────────────────────────────────────────────────
-# ────────────────────────────────────────────────────────────────────────────────
-# LIVE tab: Simulated Stream (A2) and MQTT
-# ────────────────────────────────────────────────────────────────────────────────
-# ────────────────────────────────────────────────────────────────────────────────
-# LIVE tab: Simulated Stream (A2) and MQTT
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# LIVE: Simulated Stream + MQTT (queue-based, smooth, zoomable)
+# ────────────────────────────────────────────────────────────────────
 with tab_live:
     st.subheader("🟢 Live Monitoring (Real-Time)")
 
-    mode = st.radio("Select Live Mode:", ["Simulated Stream (A2)", "MQTT Live"], horizontal=True)
+    mode = st.radio("Live Mode:", ["Simulated Stream", "MQTT Live"], horizontal=True)
 
-    # KPI + charts placeholders
-    k1, k2, k3, k4 = st.columns(4)
-    chart_area = st.empty()
-    status_area = st.empty()
-
-    # Quick scorer for live windows
-    def score_live_window(arr):
-        # Need enough samples for the LSTM windowing (very important)
-        MIN_SAMPLES = 300   # try 200 if you want faster trigger
-    
-        if arr is None or len(arr) < MIN_SAMPLES:
-            # Not enough data yet → return empty signals, no scoring
-            return np.array([]), np.array([]), 0.0
-    
-        df = pd.DataFrame({"vibration_rms": arr})
-    
-        try:
-            lstm_scores = model.score_sequences(df, "vibration_rms")
-        except Exception:
-            # If model crashes due to sequence edge conditions, skip scoring this cycle
-            return np.array([]), np.array([]), 0.0
-    
-        if_scores = np.zeros_like(lstm_scores)
-    
-        fused = fuse_scores(model, if_scores, lstm_scores)
-    
-        thr = float(np.percentile(fused[:min(2000, len(fused))], 99))
-        decisions = (fused >= thr).astype(int)
-    
-        return fused, decisions, thr
-    import queue
-
-# Create shared queue once
-    if "message_queue" not in st.session_state:
-        st.session_state.message_queue = queue.Queue()
-    
+    # Thread-safe queue → session buffers
     def process_message_queue():
-        while not st.session_state.message_queue.empty():
+        processed = 0
+        q = st.session_state.message_queue
+        while not q.empty():
             try:
-                msg = st.session_state.message_queue.get_nowait()
-                x = float(msg.get("x", 0))
-                y = float(msg.get("y", 0))
-                z = float(msg.get("z", 0))
+                msg = q.get_nowait()
+                x = float(msg.get("x", 0.0))
+                y = float(msg.get("y", 0.0))
+                z = float(msg.get("z", 0.0))
                 rpm = float(msg.get("rpm", 1500))
                 temp = float(msg.get("temp", 65))
-    
-                rms = math.sqrt((x*x + y*y + z*z) / 3.0)
+                # RMS (A): sqrt((x^2+y^2+z^2)/3)
+                rms = math.sqrt((x*x + y*y + z*z)/3.0)
+                st.session_state.vibration_x.append(x)
+                st.session_state.vibration_y.append(y)
+                st.session_state.vibration_z.append(z)
                 st.session_state.live_buffer.append(rms)
                 st.session_state.live_rpm.append(rpm)
                 st.session_state.live_temp.append(temp)
-            except:
-                pass
-    
-    def create_client():
-        def on_message(client, userdata, msg):
-            try:
-                payload = json.loads(msg.payload.decode())
-                st.session_state.message_queue.put(payload)
-            except:
-                pass
-    
-        client = mqtt.Client()
-        client.on_message = on_message
-        return client
-    
-    if st.button("🔌 Connect to MQTT"):
-        client = create_client()
-        client.connect("broker.hivemq.com", 1883, 60)
-        client.subscribe("machine/vibration/data")
-        client.loop_start()
-        st.session_state.mqtt_connected = True
-    
-    # Live Display Loop
-    plot = st.empty()
-    
-    while st.session_state.mqtt_connected:
-        process_message_queue()
-    
-        data = np.array(st.session_state.live_buffer)[-400:]
-        if len(data) > 10:
-            fig, ax = plt.subplots(figsize=(8, 3))
-            ax.plot(data, linewidth=1.7, color="steelblue")
-            ax.set_title("Real-Time Vibration (RMS)")
-            plot.pyplot(fig)
-    
-        time.sleep(0.2)
+                processed += 1
+            except Exception:
+                break
+        return processed
 
+    # Plot controls
+    left, right = st.columns([2,1])
+    with left:
+        series_choice = st.selectbox("Series", ["RMS", "X", "Y", "Z", "RPM", "Temp"], index=0)
+    with right:
+        display_points = st.slider("Points", 200, 2000, max_points, 100)
 
+    # Live figure placeholder
+    chart_placeholder = st.empty()
+    k1, k2, k3, k4 = st.columns(4)
 
-    # Push samples to buffer
-    def push_sample_data(x, y, z, rpm=None, temp=None):
-        rms = math.sqrt((x*x + y*y + z*z) / 3.0)
-        st.session_state.live_buffer.append(rms)
-    
-        if rpm is not None:
-            st.session_state.live_rpm.append(float(rpm))
-    
-        if temp is not None:
-            st.session_state.live_temp.append(float(temp))
+    def get_series(choice):
+        if choice == "RMS": return np.array(st.session_state.live_buffer)
+        if choice == "X":   return np.array(st.session_state.vibration_x)
+        if choice == "Y":   return np.array(st.session_state.vibration_y)
+        if choice == "Z":   return np.array(st.session_state.vibration_z)
+        if choice == "RPM": return np.array(st.session_state.live_rpm)
+        if choice == "Temp":return np.array(st.session_state.live_temp)
+        return np.array([])
 
+    def draw_chart(series: np.ndarray, title: str):
+        series = series[-display_points:]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(y=series, mode="lines", name=title))
+        fig.update_layout(
+            title=f"{title} — Live (Zoom/Pan enabled)",
+            xaxis_title="Sample",
+            yaxis_title="Value",
+            height=380,
+            template="plotly_white",
+        )
+        chart_placeholder.plotly_chart(fig, use_container_width=True)
 
-    # ─────────────────────────────
-    # MODE A2 - Simulated Stream
-    # ─────────────────────────────
-    if mode == "Simulated Stream (A2)":
-        st.write("📡 Streaming demo data live...")
+    # Simulated stream
+    if mode == "Simulated Stream":
+        sim_rate = st.slider("Samples per tick", 1, 100, 20, 1)
+        c1, c2, c3 = st.columns(3)
+        if c1.button("▶️ Start"): st.session_state.live_running = True
+        if c2.button("⏸️ Pause"): st.session_state.live_running = False
+        if c3.button("🧹 Reset"):
+            st.session_state.live_running = False
+            for k in ("live_buffer","vibration_x","vibration_y","vibration_z","live_rpm","live_temp"):
+                st.session_state[k].clear()
 
-        sim_rate = st.slider("Samples per update", 1, 100, 20)
         demo = load_demo_dataframe()
-
+        xs, ys, zs = None, None, None
         if {"x","y","z"}.issubset(demo.columns):
             xs, ys, zs = demo["x"].values, demo["y"].values, demo["z"].values
         else:
             rms = demo["vibration_rms"].values
             xs, ys, zs = rms*0.97, rms*1.01, rms*1.03
 
-        if st.button("Start Simulation"):
-            st.session_state.live_running = True
-
+        # Live loop
         if st.session_state.live_running:
-            if "sim_idx" not in st.session_state: st.session_state.sim_idx = 0
-            for i in range(st.session_state.sim_idx, st.session_state.sim_idx + sim_rate):
+            if "sim_idx" not in st.session_state:
+                st.session_state.sim_idx = 0
+            i0, i1 = st.session_state.sim_idx, st.session_state.sim_idx + sim_rate
+            for i in range(i0, i1):
                 j = i % len(xs)
-                push_sample_data(xs[j], ys[j], zs[j],
-                                 rpm=1500 + 20*np.sin(j/200),
-                                 temp=65 + 1.5*np.sin(j/350))
-            st.session_state.sim_idx += sim_rate
+                x, y, z = float(xs[j]), float(ys[j]), float(zs[j])
+                rpm  = 1500 + 25*np.sin(j/180) + np.random.randn()*5
+                temp = 65 + 1.5*np.sin(j/360) + np.random.randn()*0.4
+                msg = {"x":x, "y":y, "z":z, "rpm":rpm, "temp":temp}
+                st.session_state.message_queue.put(msg)
+            st.session_state.sim_idx = i1
 
-        recent = list(st.session_state.live_buffer)[-max_points:]
-        recent_rpm = list(st.session_state.live_rpm)[-max_points:]
-        recent_temp = list(st.session_state.live_temp)[-max_points:]
+        # Update buffers & UI every tick
+        processed = process_message_queue()
+        series = get_series(series_choice)
+        if series.size:
+            k1.metric("Samples", int(series.size))
+            if series_choice == "RMS" and series.size >= 32:
+                fused, dec, thr = score_live_window(series[-display_points:], model)
+                faults = int((dec == 1).sum()) if dec.size else 0
+                k2.metric("Fault Windows", faults)
+                k3.metric("Decision thr", f"{thr:.4f}" if thr else "—")
+            k4.metric("Update (ms)", update_interval)
+            draw_chart(series, series_choice)
+        else:
+            st.info("Waiting for data…")
 
-        if recent:
-            fused, dec, thr = score_live_window(np.array(recent))
-            faults = (dec == 1).sum() if len(dec) else 0
+        time.sleep(update_interval/1000.0)
+        st.experimental_set_query_params(ts=str(time.time()))
 
-            k1.metric("Health", f"{100 - faults:.0f}%")
-            k2.metric("RPM", f"{recent_rpm[-1]:.0f}" if recent_rpm else "—")
-            k3.metric("Temp (°C)", f"{recent_temp[-1]:.1f}" if recent_temp else "—")
-            k4.metric("Fault Windows", faults)
+    # MQTT Live
+    else:
+        st.caption("🌍 Broker: broker.hivemq.com:1883  •  Topic: `machine/vibration/data`")
 
-            df_plot = pd.DataFrame({"RMS": recent})
-            if recent_rpm: df_plot["RPM"] = recent_rpm
-            if recent_temp: df_plot["Temp"] = recent_temp
-            chart_area.line_chart(df_plot)
+        def create_mqtt_client():
+            def on_connect(client, userdata, flags, rc):
+                if rc == 0:
+                    st.session_state.mqtt_connected = True
+                    client.subscribe("machine/vibration/data", qos=0)
+                else:
+                    st.session_state.mqtt_last_err = f"Connect failed (rc={rc})"
 
-        time.sleep(update_interval/1000)
-        st.rerun()
+            def on_message(client, userdata, msg):
+                try:
+                    payload = json.loads(msg.payload.decode("utf-8"))
+                    st.session_state.message_queue.put(payload)
+                except Exception:
+                    pass
 
-    # ─────────────────────────────
-    # MODE MQTT
-    # ─────────────────────────────
-        # ─────────────────────────────
-    # MODE MQTT  (TCP :1883, no websockets)
-    # ─────────────────────────────
-    if mode == "MQTT Live":
-        st.write("🌍 MQTT Live Telemetry Mode (TCP 1883)")
-
-        broker = "broker.hivemq.com"
-        port = 1883
-        topic = "machine/vibration/data"
-
-        # IMPORTANT: don't call Streamlit UI from callbacks except via session_state
-        def on_connect(client, userdata, flags, rc, props=None):
-            if rc == 0:
-                st.session_state.mqtt_connected = True
-                st.session_state.mqtt_last_err = ""
-                client.subscribe(topic)
-            else:
-                st.session_state.mqtt_connected = False
-                st.session_state.mqtt_last_err = f"Connect failed (rc={rc})"
-
-        def on_message(client, userdata, msg):
             try:
-                j = json.loads(msg.payload.decode("utf-8"))
-                x = float(j.get("x", 0.0))
-                y = float(j.get("y", 0.0))
-                z = float(j.get("z", 0.0))
-                rpm = j.get("rpm", None)
-                temp = j.get("temp", None)
-                push_sample_data(x, y, z, rpm=rpm, temp=temp)
+                client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
             except Exception:
-                # ignore malformed payloads
-                pass
+                client = mqtt.Client()
+            client.on_connect = on_connect
+            client.on_message = on_message
+            return client
 
         colA, colB = st.columns(2)
-        if colA.button("🔌 Connect (TCP 1883)", type="primary", disabled=st.session_state.mqtt_connected):
+        if colA.button("🔌 Connect", disabled=st.session_state.mqtt_connected):
             try:
-                # Plain TCP client (no websockets)
-                try:
-                    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-                except:
-                    client = mqtt.Client()
-                client.on_connect = on_connect
-                client.on_message = on_message
-                client.connect(broker, port, 60)
+                client = create_mqtt_client()
+                client.connect("broker.hivemq.com", 1883, 60)
                 client.loop_start()
                 st.session_state.mqtt_client = client
-                time.sleep(0.2)
-                st.rerun()
+                st.success("Connected")
             except Exception as e:
                 st.error(f"MQTT error: {e}")
 
         if colB.button("🔕 Disconnect", disabled=not st.session_state.mqtt_connected):
             c = st.session_state.get("mqtt_client")
             if c:
-                c.loop_stop()
-                c.disconnect()
+                try:
+                    c.loop_stop(); c.disconnect()
+                except Exception:
+                    pass
             st.session_state.mqtt_connected = False
-            st.session_state.mqtt_last_err = "Disconnected"
-            st.rerun()
+            st.info("Disconnected")
 
-        if st.session_state.mqtt_connected:
-            st.success("✅ Connected (TCP 1883)")
-        if st.session_state.mqtt_last_err:
-            st.warning(st.session_state.mqtt_last_err)
+        # Update buffers & UI on each refresh
+        processed = process_message_queue()
+        if processed: st.caption(f"📨 Processed {processed} messages")
 
-        # Draw latest buffer
-        recent = list(st.session_state.live_buffer)[-max_points:]
-        recent_rpm = list(st.session_state.live_rpm)[-max_points:]
-        recent_temp = list(st.session_state.live_temp)[-max_points:]
+        series = get_series(series_choice)
+        if series.size:
+            k1.metric("Samples", int(series.size))
+            if series_choice == "RMS" and series.size >= 32:
+                fused, dec, thr = score_live_window(series[-display_points:], model)
+                faults = int((dec == 1).sum()) if dec.size else 0
+                k2.metric("Fault Windows", faults)
+                k3.metric("Decision thr", f"{thr:.4f}" if thr else "—")
+            k4.metric("Connected", "✅" if st.session_state.mqtt_connected else "—")
+            draw_chart(series, series_choice)
+        else:
+            st.info("Waiting for data…")
 
-        if recent:
-            fused, dec, thr = score_live_window(np.array(recent))
-            faults = (dec == 1).sum() if len(dec) else 0
-
-            k1.metric("Health", f"{100 - faults:.0f}%")
-            k2.metric("RPM", f"{recent_rpm[-1]:.0f}" if recent_rpm else "—")
-            k3.metric("Temp (°C)", f"{recent_temp[-1]:.1f}" if recent_temp else "—")
-            k4.metric("Fault Windows", faults)
-
-            df_plot = pd.DataFrame({"RMS": recent})
-            if recent_rpm: df_plot["RPM"] = recent_rpm
-            if recent_temp: df_plot["Temp"] = recent_temp
-            chart_area.line_chart(df_plot, use_container_width=True)
-
-        # Keep the app ticking for live redraws
         time.sleep(update_interval/1000.0)
-        st.rerun()
+        st.experimental_set_query_params(ts=str(time.time()))
 
-
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Admin: Asset table & thresholds
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# Admin
+# ────────────────────────────────────────────────────────────────────
 with tab_admin:
     st.subheader("🏷️ Asset Health Table")
-
-    # Build a lightweight snapshot row from latest buffer / last offline result if any
-    latest_obs = None
-    if len(st.session_state.live_buffer) > 0:
-        latest_obs = float(st.session_state.live_buffer[-1])
-
-    threshold_hint = 0.6  # display-only default; your model threshold is percentile-based
-    status = "OK"
-    priority = "Low"
-    if latest_obs is not None and latest_obs > threshold_hint:
-        status = "Alert"
-        priority = "High"
-
+    latest_obs = float(st.session_state.live_buffer[-1]) if len(st.session_state.live_buffer) else np.nan
+    threshold_hint = 0.6
+    status = "Alert" if (not np.isnan(latest_obs) and latest_obs > threshold_hint) else "OK"
+    priority = "High" if status == "Alert" else "Low"
     created_on = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
     asset = st.session_state.asset_name
-
     table = pd.DataFrame([{
-        "Asset Name": asset,
-        "Signal": "vibration_rms",
-        "Priority": priority,
-        "Status": status,
-        "Created On": created_on,
-        "Threshold": threshold_hint,
-        "Observed": latest_obs if latest_obs is not None else np.nan
+        "Asset Name": asset, "Signal": "vibration_rms", "Priority": priority,
+        "Status": status, "Created On": created_on, "Threshold": threshold_hint, "Observed": latest_obs
     }])
-
     st.dataframe(table, use_container_width=True)
-
-    st.download_button(
-        "⬇️ Export Asset Table (CSV)",
-        data=table.to_csv(index=False).encode("utf-8"),
-        file_name="asset_health_table.csv",
-        mime="text/csv"
-    )
+    st.download_button("⬇️ Export Asset Table (CSV)", data=table.to_csv(index=False).encode("utf-8"),
+                       file_name="asset_health_table.csv", mime="text/csv")
