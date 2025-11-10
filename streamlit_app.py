@@ -513,25 +513,38 @@ with tab_live:
         return np.array(data[-window_n:])
 
     series = pick_series()
-
-    # KPIs and plots
+# KPIs and plots
     k1, k2, k3, k4 = st.columns(4)
     if series.size:
-        # For vibration, also compute anomaly quick-scan
+        # Defaults
         faults = 0
+        thr = float("nan")
+    
         if sensor_choice == "Vibration":
             fused, dec, thr = score_live_window(series)
             faults = int((dec == 1).sum()) if dec.size else 0
+    
+            # ✅ send Telegram alert only when we actually have faults
+            if faults > 0:
+                msg = (
+                    f"⚠️ Fault Detected!\n"
+                    f"Asset: {st.session_state.asset_name}\n"
+                    f"Fault Windows (buffer): {faults}"
+                )
+                send_alert(msg)
+    
             k1.metric("Fault windows (buffer)", faults)
-            k2.metric("Decision thr (live)", f"{thr:.4f}")
+            k2.metric("Decision thr (live)", f"{thr:.4f}" if not np.isnan(thr) else "—")
         else:
             k1.metric("Samples", int(series.size))
-
+            k2.metric("Decision thr (live)", "—")
+    
         k3.metric("Last value", f"{series[-1]:.4f}")
         k4.metric("Threshold", threshold)
-
+    
         # Draw chart (line + horizontal threshold marker via matplotlib)
         import matplotlib.pyplot as plt
+
         fig, ax = plt.subplots(figsize=(10, 3))
         ax.plot(series)
         ax.axhline(threshold, linestyle="--")
