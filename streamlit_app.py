@@ -330,7 +330,7 @@ with tab_live:
             for _ in range(sim_rate):
                 j = st.session_state.sim_idx % len(xs)
                 st.session_state.message_queue.put({
-                    "x": xs[j], "y": ys[j], "z": zs[j],
+                    "x": xs[j], "y": ys[j], "z": zs[j] * 3,
                     "rpm": 1500 + 10*np.sin(j/200),
                     "temp": 65 + 1.0*np.sin(j/350)
                 })
