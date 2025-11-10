@@ -153,8 +153,9 @@ for k in ("live_running","mqtt_connected","mqtt_last_err"):
 if "asset_name" not in st.session_state:
     st.session_state.asset_name = "Motor-001"
     
-if "last_alert_time" not in st.session_state:
-    st.session_state.last_alert_time = datetime.min
+if "alert_log" not in st.session_state:
+    st.session_state.alert_log = []  # stores tuples like (timestamp, message)
+
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -402,54 +403,68 @@ with tab_live:
 
 
     # ---- Refresh UI ----
-    # ---- Refresh UI ----
     processed = process_message_queue()
     series = get_series(series_choice)
     
     # --- TELEGRAM ALERT LOGIC ---
     alert_threshold = 0.85
-    recovery_threshold = alert_threshold * 0.8  # Avoid alert spam-switching
+    recovery_threshold = alert_threshold * 0.8
     
     current_rms = float(st.session_state.live_buffer[-1]) if len(st.session_state.live_buffer) else 0
     
     now = datetime.utcnow()
-    cooldown = timedelta(seconds=30)  # optional cooldown if you want it
+    cooldown = timedelta(seconds=30)
+    
     if "alert_mode" not in st.session_state:
         st.session_state.alert_mode = False
     if "last_alert_time" not in st.session_state:
         st.session_state.last_alert_time = datetime.min
+    if "alert_log" not in st.session_state:
+        st.session_state.alert_log = []
     
-    # If RMS crosses threshold → Send fault alert
+    # HIGH vibration alert
     if current_rms > alert_threshold and not st.session_state.alert_mode:
-        send_telegram_alert(
-            f"🚨 HIGH VIBRATION ALERT\n"
-            f"Machine: {st.session_state.asset_name}\n"
-            f"RMS = {current_rms:.4f} (Threshold = {alert_threshold})\n"
-            f"⚠️ Immediate Check Recommended."
+        msg = (
+            f"🚨 HIGH VIBRATION ALERT | {st.session_state.asset_name} | "
+            f"RMS={current_rms:.4f} > {alert_threshold}"
         )
+        send_telegram_alert(msg)
+        st.session_state.alert_log.append((datetime.utcnow(), msg))
+        st.session_state.alert_log = st.session_state.alert_log[-10:]
         st.session_state.alert_mode = True
         st.session_state.last_alert_time = now
     
-    # If vibration returns to normal → Send recovery alert
+    # Recovery alert
     elif current_rms < recovery_threshold and st.session_state.alert_mode:
-        send_telegram_alert(
-            f"✅ Vibration Normalized\n"
-            f"Machine: {st.session_state.asset_name}\n"
-            f"RMS back to {current_rms:.4f}"
+        msg = (
+            f"✅ Vibration Normalized | {st.session_state.asset_name} | "
+            f"RMS={current_rms:.4f}"
         )
+        send_telegram_alert(msg)
+        st.session_state.alert_log.append((datetime.utcnow(), msg))
+        st.session_state.alert_log = st.session_state.alert_log[-10:]
         st.session_state.alert_mode = False
     
-    # ---- KPI + CHART (always draw when we have data) ----
+    # ---- KPI + CHART ----
     if series.size:
         k1.metric("Samples", int(series.size))
-        # (add more KPIs if you want)
         draw_chart(series, series_choice)
     else:
         st.info("Waiting for data...")
     
+    # ---- ALERT LOG PANEL ----
+    st.markdown("### 🔔 Recent Alerts")
+    if st.session_state.alert_log:
+        alert_df = pd.DataFrame(
+            [(t.strftime("%Y-%m-%d %H:%M:%S UTC"), m) for t, m in st.session_state.alert_log],
+            columns=["Timestamp", "Message"]
+        )
+        st.table(alert_df)
+    else:
+        st.caption("No alerts yet.")
+    
     time.sleep(update_interval/1000)
     st.rerun()
-
 
 
 # ────────────────────────────────────────────────────────────────────
