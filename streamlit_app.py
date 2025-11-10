@@ -327,6 +327,63 @@ with tab_live:
         decisions = (fused >= thr).astype(int)
     
         return fused, decisions, thr
+    import queue
+
+# Create shared queue once
+    if "message_queue" not in st.session_state:
+        st.session_state.message_queue = queue.Queue()
+    
+    def process_message_queue():
+        while not st.session_state.message_queue.empty():
+            try:
+                msg = st.session_state.message_queue.get_nowait()
+                x = float(msg.get("x", 0))
+                y = float(msg.get("y", 0))
+                z = float(msg.get("z", 0))
+                rpm = float(msg.get("rpm", 1500))
+                temp = float(msg.get("temp", 65))
+    
+                rms = math.sqrt((x*x + y*y + z*z) / 3.0)
+                st.session_state.live_buffer.append(rms)
+                st.session_state.live_rpm.append(rpm)
+                st.session_state.live_temp.append(temp)
+            except:
+                pass
+    
+    def create_client():
+        def on_message(client, userdata, msg):
+            try:
+                payload = json.loads(msg.payload.decode())
+                st.session_state.message_queue.put(payload)
+            except:
+                pass
+    
+        client = mqtt.Client()
+        client.on_message = on_message
+        return client
+    
+    if st.button("🔌 Connect to MQTT"):
+        client = create_client()
+        client.connect("broker.hivemq.com", 1883, 60)
+        client.subscribe("machine/vibration/data")
+        client.loop_start()
+        st.session_state.mqtt_connected = True
+    
+    # Live Display Loop
+    plot = st.empty()
+    
+    while st.session_state.mqtt_connected:
+        process_message_queue()
+    
+        data = np.array(st.session_state.live_buffer)[-400:]
+        if len(data) > 10:
+            fig, ax = plt.subplots(figsize=(8, 3))
+            ax.plot(data, linewidth=1.7, color="steelblue")
+            ax.set_title("Real-Time Vibration (RMS)")
+            plot.pyplot(fig)
+    
+        time.sleep(0.2)
+
 
 
     # Push samples to buffer
