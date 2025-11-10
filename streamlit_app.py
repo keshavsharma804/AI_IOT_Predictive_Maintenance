@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from src.utils.telegram_alert import send_alert
+import plotly.graph_objects as go
 
 
 # Optional imports (graceful fallback if not present)
@@ -435,18 +436,25 @@ with tab_live:
             def on_message(client, userdata, msg):
                 try:
                     j = json.loads(msg.payload.decode("utf-8"))
+            
+                    # Support both formats:
                     ax = float(j.get("axial", j.get("x", 0.0)))
                     hz = float(j.get("horizontal", j.get("y", 0.0)))
                     vt = float(j.get("vertical", j.get("z", 0.0)))
-                    rpm = j.get("rpm")
-                    temp = j.get("temp")
-                    acoustic = j.get("acoustic")
-                    magnetic = j.get("mag")
-                    current = j.get("current")
+            
+                    # If temp, rpm etc. are not present, make dummy values:
+                    rpm = float(j.get("rpm", 1500))
+                    temp = float(j.get("temp", 65))
+                    acoustic = float(j.get("acoustic", 0.2))
+                    magnetic = float(j.get("mag", 0.1))
+                    current = float(j.get("current", 3.0))
+            
                     push_sample_data(ax, hz, vt, rpm=rpm, temp=temp,
                                      acoustic=acoustic, magnetic=magnetic, current=current)
-                except Exception:
-                    pass
+            
+                except Exception as e:
+                    st.session_state.mqtt_last_err = f"Payload error: {e}"
+
 
             ca, cb, cc = st.columns(3)
             if ca.button("🔌 Connect"):
