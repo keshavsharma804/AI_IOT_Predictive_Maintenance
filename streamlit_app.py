@@ -407,8 +407,8 @@ with tab_live:
     series = get_series(series_choice)
     
     # --- TELEGRAM ALERT LOGIC ---
-    alert_threshold = 0.85
-    recovery_threshold = alert_threshold * 0.8
+    alert_threshold = 1.2
+    recovery_threshold = 1.0
     
     current_rms = float(st.session_state.live_buffer[-1]) if len(st.session_state.live_buffer) else 0
     
