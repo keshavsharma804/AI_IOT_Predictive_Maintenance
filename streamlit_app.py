@@ -2,6 +2,7 @@ import json, time, math
 from collections import deque
 from pathlib import Path
 from threading import Lock
+import queue
 
 import numpy as np
 import pandas as pd
@@ -35,26 +36,17 @@ MODEL_DIR = ROOT / "models" / "saved_models" / "hybrid"
 DEMO_CSV = ROOT / "data" / "synthetic" / "machine_001_demo.csv"
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Thread-safe buffer management
+# Initialize session state FIRST
 # ────────────────────────────────────────────────────────────────────────────────
-if "buffer_lock" not in st.session_state:
-    st.session_state.buffer_lock = Lock()
+if "message_queue" not in st.session_state:
+    st.session_state.message_queue = queue.Queue()
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Initialize session state
-# ────────────────────────────────────────────────────────────────────────────────
 if "live_buffer" not in st.session_state:
     st.session_state.live_buffer = deque(maxlen=6000)
 if "live_rpm" not in st.session_state:
     st.session_state.live_rpm = deque(maxlen=6000)
 if "live_temp" not in st.session_state:
     st.session_state.live_temp = deque(maxlen=6000)
-if "live_acoustic" not in st.session_state:
-    st.session_state.live_acoustic = deque(maxlen=6000)
-if "live_magnetic" not in st.session_state:
-    st.session_state.live_magnetic = deque(maxlen=6000)
-if "live_current" not in st.session_state:
-    st.session_state.live_current = deque(maxlen=6000)
 
 for axis in ("axial", "horizontal", "vertical"):
     key = f"vibration_{axis}"
@@ -65,14 +57,16 @@ if "live_running" not in st.session_state:
     st.session_state.live_running = False
 if "mqtt_connected" not in st.session_state:
     st.session_state.mqtt_connected = False
-if "mqtt_last_err" not in st.session_state:
-    st.session_state.mqtt_last_err = ""
+if "mqtt_status" not in st.session_state:
+    st.session_state.mqtt_status = "Not connected"
 if "asset_name" not in st.session_state:
     st.session_state.asset_name = "Motor-001"
 if "data_counter" not in st.session_state:
     st.session_state.data_counter = 0
 if "last_message" not in st.session_state:
     st.session_state.last_message = {}
+if "connection_attempts" not in st.session_state:
+    st.session_state.connection_attempts = 0
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Utilities
@@ -106,28 +100,39 @@ def load_demo_dataframe() -> pd.DataFrame:
     df["vibration_rms"] = np.sqrt((df["x"]**2 + df["y"]**2 + df["z"]**2)/3.0)
     return df
 
-def push_sample_data(x, y, z, rpm=None, temp=None, acoustic=None, magnetic=None, current=None):
-    """Thread-safe data pushing"""
-    with st.session_state.buffer_lock:
-        st.session_state.vibration_axial.append(float(x))
-        st.session_state.vibration_horizontal.append(float(y))
-        st.session_state.vibration_vertical.append(float(z))
-        
-        rms = math.sqrt((x*x + y*y + z*z) / 3.0)
-        st.session_state.live_buffer.append(rms)
-        
-        if rpm is not None:
-            st.session_state.live_rpm.append(float(rpm))
-        if temp is not None:
-            st.session_state.live_temp.append(float(temp))
-        if acoustic is not None:
-            st.session_state.live_acoustic.append(float(acoustic))
-        if magnetic is not None:
-            st.session_state.live_magnetic.append(float(magnetic))
-        if current is not None:
-            st.session_state.live_current.append(float(current))
-        
-        st.session_state.data_counter += 1
+def process_message_queue():
+    """Process all messages from queue - called from main thread"""
+    processed = 0
+    while not st.session_state.message_queue.empty():
+        try:
+            msg_data = st.session_state.message_queue.get_nowait()
+            
+            x = float(msg_data.get("x", 0.0))
+            y = float(msg_data.get("y", 0.0))
+            z = float(msg_data.get("z", 0.0))
+            rpm = float(msg_data.get("rpm", 1500))
+            temp = float(msg_data.get("temp", 65))
+            
+            # Add to buffers
+            st.session_state.vibration_axial.append(x)
+            st.session_state.vibration_horizontal.append(y)
+            st.session_state.vibration_vertical.append(z)
+            
+            rms = math.sqrt((x*x + y*y + z*z) / 3.0)
+            st.session_state.live_buffer.append(rms)
+            st.session_state.live_rpm.append(rpm)
+            st.session_state.live_temp.append(temp)
+            
+            st.session_state.data_counter += 1
+            st.session_state.last_message = msg_data
+            processed += 1
+            
+        except queue.Empty:
+            break
+        except Exception as e:
+            st.session_state.mqtt_status = f"Process error: {e}"
+    
+    return processed
 
 def score_live_window(arr: np.ndarray, model):
     if arr.size < 32:
@@ -139,6 +144,52 @@ def score_live_window(arr: np.ndarray, model):
     thr = float(np.percentile(fused[:min(200, len(fused))], 99))
     dec = (fused >= thr).astype(int)
     return fused, dec, thr
+
+# ────────────────────────────────────────────────────────────────────────────────
+# MQTT Setup with proper callbacks
+# ────────────────────────────────────────────────────────────────────────────────
+def create_mqtt_client():
+    """Create MQTT client with callbacks that only use queue"""
+    
+    def on_connect(client, userdata, flags, rc):
+        """Connection callback - thread-safe"""
+        if rc == 0:
+            st.session_state.mqtt_connected = True
+            st.session_state.mqtt_status = "✅ Connected to broker"
+            client.subscribe("machine/vibration/data", qos=0)
+        else:
+            st.session_state.mqtt_connected = False
+            st.session_state.mqtt_status = f"❌ Connection failed (code: {rc})"
+    
+    def on_disconnect(client, userdata, rc):
+        """Disconnection callback"""
+        st.session_state.mqtt_connected = False
+        if rc != 0:
+            st.session_state.mqtt_status = f"⚠️ Unexpected disconnect (code: {rc})"
+        else:
+            st.session_state.mqtt_status = "Disconnected"
+    
+    def on_message(client, userdata, msg):
+        """Message callback - just queue it, no state manipulation"""
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+            st.session_state.message_queue.put(payload)
+        except Exception as e:
+            pass  # Silent fail in callback
+    
+    # Create client (compatible with old API)
+    try:
+        # Try new API first
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    except:
+        # Fallback to old API
+        client = mqtt.Client()
+    
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    
+    return client
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Load model
@@ -153,39 +204,28 @@ with st.sidebar:
     source = st.radio(
         "Choose input",
         ["Simulated Stream", "MQTT Live"],
-        index=0
+        index=1,  # Default to MQTT
+        key="data_source"
     )
     st.text_input("Asset Name", value=st.session_state.asset_name, key="asset_name")
     
     st.divider()
     st.header("⚙️ Settings")
-    max_points = st.slider("Max chart points", 200, 2000, 500, 100)
-    update_interval = st.slider("Update interval (ms)", 100, 2000, 500, 100)
+    update_interval = st.slider("Update interval (ms)", 200, 2000, 500, 100)
+    
+    if st.button("🧹 Clear All Data"):
+        for key in ("live_buffer","live_rpm","live_temp","vibration_axial","vibration_horizontal","vibration_vertical"):
+            st.session_state[key].clear()
+        st.session_state.data_counter = 0
+        st.session_state.last_message = {}
+        while not st.session_state.message_queue.empty():
+            st.session_state.message_queue.get()
+        st.rerun()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Main Dashboard
 # ────────────────────────────────────────────────────────────────────────────────
 st.title("🟢 Live Monitoring Dashboard")
-
-left, mid, right = st.columns([2, 2, 1.4])
-
-with left:
-    st.write(f"**Mode:** {source}")
-
-with mid:
-    sensor_choice = st.selectbox(
-        "Signal",
-        ["Vibration", "Temperature", "RPM", "Acoustics", "Magnetic Flux", "Current"]
-    )
-
-with right:
-    time_range = st.radio("Time Range", ["Last 100", "Last 500", "All"], horizontal=False)
-
-axis_choice = None
-if sensor_choice == "Vibration":
-    axis_choice = st.radio("Axis", ["All (RMS)", "Axial", "Horizontal", "Vertical"], horizontal=True)
-
-threshold = st.slider("Alert Threshold", 0.0, 2.0, 0.8, 0.1)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # MODE: Simulated Stream
@@ -196,21 +236,16 @@ if source == "Simulated Stream":
     sim_rate = st.slider("Samples per update", 1, 50, 10, 1)
     
     c1, c2, c3 = st.columns(3)
-    if c1.button("▶️ Start Stream"):
+    if c1.button("▶️ Start"):
         st.session_state.live_running = True
         st.rerun()
     
     if c2.button("⏸️ Pause"):
         st.session_state.live_running = False
     
-    if c3.button("🛑 Reset"):
+    if c3.button("🔄 Reset"):
         st.session_state.live_running = False
-        with st.session_state.buffer_lock:
-            for key in ("live_buffer","live_rpm","live_temp","live_acoustic","live_magnetic","live_current",
-                        "vibration_axial","vibration_horizontal","vibration_vertical"):
-                st.session_state[key].clear()
-            st.session_state.pop("sim_idx", None)
-            st.session_state.data_counter = 0
+        st.session_state.pop("sim_idx", None)
         st.rerun()
     
     if st.session_state.live_running:
@@ -231,128 +266,88 @@ if source == "Simulated Stream":
             j = i % len(xs)
             rpm = 1500 + 25*np.sin(j/180) + np.random.randn()*5
             temp = 65 + 1.5*np.sin(j/360) + np.random.randn()*0.5
-            acoustic = 0.2 + 0.02*np.sin(j/140) + np.random.randn()*0.01
-            magnetic = 0.1 + 0.01*np.sin(j/200) + np.random.randn()*0.005
-            current = 3.0 + 0.1*np.sin(j/220) + np.random.randn()*0.05
             
-            push_sample_data(xs[j], ys[j], zs[j], rpm=rpm, temp=temp,
-                           acoustic=acoustic, magnetic=magnetic, current=current)
+            st.session_state.vibration_axial.append(float(xs[j]))
+            st.session_state.vibration_horizontal.append(float(ys[j]))
+            st.session_state.vibration_vertical.append(float(zs[j]))
+            
+            rms = math.sqrt((xs[j]**2 + ys[j]**2 + zs[j]**2) / 3.0)
+            st.session_state.live_buffer.append(rms)
+            st.session_state.live_rpm.append(rpm)
+            st.session_state.live_temp.append(temp)
+            st.session_state.data_counter += 1
         
         st.session_state.sim_idx = i1
         time.sleep(update_interval/1000.0)
         st.rerun()
 
 # ────────────────────────────────────────────────────────────────────────────────
-# MODE: MQTT Live - FIXED for port 1883
+# MODE: MQTT Live
 # ────────────────────────────────────────────────────────────────────────────────
 elif source == "MQTT Live":
-    st.caption("🌍 MQTT broker: broker.hivemq.com:1883 (TCP)")
-    st.caption("📝 Topic: machine/vibration/data")
+    st.caption("🌍 **Broker:** broker.hivemq.com:1883 | **Topic:** machine/vibration/data")
     
     if not MQTT_OK:
-        st.error("Install MQTT: `pip install paho-mqtt`")
+        st.error("❌ Install MQTT: `pip install paho-mqtt`")
     else:
-        # Show last received message
-        if st.session_state.last_message:
-            with st.expander("📨 Last Received Message", expanded=True):
-                st.json(st.session_state.last_message)
+        col1, col2, col3 = st.columns(3)
         
-        def on_connect(client, userdata, flags, rc, properties=None):
-            """Callback when connected - NO Streamlit calls here"""
-            if rc == 0:
-                st.session_state.mqtt_connected = True
-                st.session_state.mqtt_last_err = ""
-                client.subscribe("machine/vibration/data", qos=0)
-            else:
-                st.session_state.mqtt_connected = False
-                st.session_state.mqtt_last_err = f"Connect failed (rc={rc})"
-        
-        def on_message(client, userdata, msg):
-            """Callback when message received - NO Streamlit calls here"""
-            try:
-                payload = msg.payload.decode("utf-8")
-                j = json.loads(payload)
-                
-                # Store last message for display
-                st.session_state.last_message = j
-                
-                # Support both naming conventions
-                ax = float(j.get("axial", j.get("x", 0.0)))
-                hz = float(j.get("horizontal", j.get("y", 0.0)))
-                vt = float(j.get("vertical", j.get("z", 0.0)))
-                
-                rpm = float(j.get("rpm", 1500))
-                temp = float(j.get("temp", 65))
-                acoustic = float(j.get("acoustic", 0.2))
-                magnetic = float(j.get("mag", 0.1))
-                current = float(j.get("current", 3.0))
-                
-                # Thread-safe push
-                push_sample_data(ax, hz, vt, rpm=rpm, temp=temp,
-                               acoustic=acoustic, magnetic=magnetic, current=current)
-                
-                st.session_state.mqtt_last_err = ""
-                
-            except Exception as e:
-                st.session_state.mqtt_last_err = f"Parse error: {e}"
-        
-        ca, cb, cc = st.columns(3)
-        
-        if ca.button("🔌 Connect MQTT"):
-            try:
-                # Use standard TCP connection (port 1883)
-                client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-                client.on_connect = on_connect
-                client.on_message = on_message
-                
-                # Connect to standard MQTT port
-                client.connect("broker.hivemq.com", 1883, 60)
-                client.loop_start()
-                
-                st.session_state.mqtt_client = client
-                st.success("Connecting to broker.hivemq.com:1883...")
-                time.sleep(1)
-                st.rerun()
-                
-            except Exception as e:
-                st.error(f"Connection error: {e}")
-                st.session_state.mqtt_last_err = str(e)
-        
-        if cb.button("🔕 Disconnect"):
-            c = st.session_state.get("mqtt_client")
-            if c:
+        with col1:
+            if st.button("🔌 Connect", type="primary", disabled=st.session_state.mqtt_connected):
                 try:
-                    c.loop_stop()
-                    c.disconnect()
-                except:
-                    pass
-            st.session_state.mqtt_connected = False
-            st.session_state.last_message = {}
-            st.rerun()
+                    # Create new client
+                    client = create_mqtt_client()
+                    client.connect("broker.hivemq.com", 1883, 60)
+                    client.loop_start()
+                    
+                    st.session_state.mqtt_client = client
+                    st.session_state.connection_attempts += 1
+                    st.session_state.mqtt_status = "Connecting..."
+                    
+                    time.sleep(1)  # Give it a moment
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.session_state.mqtt_status = f"❌ Error: {str(e)}"
+                    st.session_state.mqtt_connected = False
         
-        if cc.button("🧹 Clear Buffers"):
-            with st.session_state.buffer_lock:
-                for key in ("live_buffer","live_rpm","live_temp","live_acoustic","live_magnetic","live_current",
-                            "vibration_axial","vibration_horizontal","vibration_vertical"):
-                    st.session_state[key].clear()
-                st.session_state.data_counter = 0
-                st.session_state.last_message = {}
-            st.rerun()
+        with col2:
+            if st.button("🔕 Disconnect", disabled=not st.session_state.mqtt_connected):
+                client = st.session_state.get("mqtt_client")
+                if client:
+                    try:
+                        client.loop_stop()
+                        client.disconnect()
+                    except:
+                        pass
+                st.session_state.mqtt_connected = False
+                st.session_state.mqtt_status = "Disconnected"
+                st.rerun()
         
-        # Status indicators
-        col_status1, col_status2 = st.columns(2)
+        with col3:
+            st.metric("Connection Attempts", st.session_state.connection_attempts)
         
-        with col_status1:
-            if st.session_state.mqtt_connected:
-                st.success("✅ MQTT Connected")
-            else:
-                st.info("⏸️ Not connected")
+        # Status display
+        st.info(st.session_state.mqtt_status)
         
-        with col_status2:
-            st.metric("Messages Received", st.session_state.data_counter)
+        # Process queued messages
+        if st.session_state.mqtt_connected:
+            processed = process_message_queue()
+            if processed > 0:
+                st.success(f"📨 Processed {processed} messages")
         
-        if st.session_state.mqtt_last_err:
-            st.warning(f"⚠️ {st.session_state.mqtt_last_err}")
+        # Display last message
+        if st.session_state.last_message:
+            with st.expander("📩 Last Received Message", expanded=True):
+                col_a, col_b, col_c = st.columns(3)
+                msg = st.session_state.last_message
+                col_a.metric("X", f"{msg.get('x', 0):.4f}")
+                col_b.metric("Y", f"{msg.get('y', 0):.4f}")
+                col_c.metric("Z", f"{msg.get('z', 0):.4f}")
+                
+                col_d, col_e = st.columns(2)
+                col_d.metric("RPM", f"{msg.get('rpm', 0):.2f}")
+                col_e.metric("Temp", f"{msg.get('temp', 0):.2f}")
         
         # Auto-refresh when connected
         if st.session_state.mqtt_connected:
@@ -360,40 +355,39 @@ elif source == "MQTT Live":
             st.rerun()
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Data Visualization (Common for both modes)
+# Data Visualization (Common)
 # ────────────────────────────────────────────────────────────────────────────────
-def pick_series():
-    with st.session_state.buffer_lock:
-        if sensor_choice == "Vibration":
-            if axis_choice == "Axial":
-                return np.array(list(st.session_state.vibration_axial))
-            elif axis_choice == "Horizontal":
-                return np.array(list(st.session_state.vibration_horizontal))
-            elif axis_choice == "Vertical":
-                return np.array(list(st.session_state.vibration_vertical))
-            else:
-                return np.array(list(st.session_state.live_buffer))
-        elif sensor_choice == "Temperature":
-            return np.array(list(st.session_state.live_temp))
-        elif sensor_choice == "RPM":
-            return np.array(list(st.session_state.live_rpm))
-        elif sensor_choice == "Acoustics":
-            return np.array(list(st.session_state.live_acoustic))
-        elif sensor_choice == "Magnetic Flux":
-            return np.array(list(st.session_state.live_magnetic))
-        elif sensor_choice == "Current":
-            return np.array(list(st.session_state.live_current))
-        return np.array([])
-
-series = pick_series()
-
-# Apply time range
-if time_range == "Last 100":
-    series = series[-100:]
-elif time_range == "Last 500":
-    series = series[-500:]
-
 st.divider()
+
+# Controls
+left, right = st.columns(2)
+with left:
+    sensor_choice = st.selectbox(
+        "Signal to Display",
+        ["Vibration (RMS)", "Vibration X", "Vibration Y", "Vibration Z", "RPM", "Temperature"]
+    )
+with right:
+    max_points = st.slider("Display points", 50, 1000, 200, 50)
+
+threshold = st.slider("Alert Threshold", 0.0, 2.0, 0.8, 0.05)
+
+# Select data series
+def get_series():
+    if sensor_choice == "Vibration (RMS)":
+        return np.array(list(st.session_state.live_buffer))
+    elif sensor_choice == "Vibration X":
+        return np.array(list(st.session_state.vibration_axial))
+    elif sensor_choice == "Vibration Y":
+        return np.array(list(st.session_state.vibration_horizontal))
+    elif sensor_choice == "Vibration Z":
+        return np.array(list(st.session_state.vibration_vertical))
+    elif sensor_choice == "RPM":
+        return np.array(list(st.session_state.live_rpm))
+    elif sensor_choice == "Temperature":
+        return np.array(list(st.session_state.live_temp))
+    return np.array([])
+
+series = get_series()[-max_points:]
 
 # KPIs
 k1, k2, k3, k4 = st.columns(4)
@@ -404,26 +398,19 @@ if series.size > 0:
     max_val = float(np.max(series))
     min_val = float(np.min(series))
     
-    faults = 0
-    if sensor_choice == "Vibration" and series.size >= 32:
+    k1.metric("Current", f"{current_val:.4f}", 
+              delta=f"{current_val - avg_val:.4f}")
+    k2.metric("Average", f"{avg_val:.4f}")
+    k3.metric("Range", f"{max_val - min_val:.4f}")
+    k4.metric("Total Samples", st.session_state.data_counter)
+    
+    # Anomaly detection for vibration
+    if "Vibration" in sensor_choice and series.size >= 32:
         fused, dec, thr = score_live_window(series, model)
         faults = int((dec == 1).sum()) if dec.size else 0
         
         if faults > 0:
-            msg = f"⚠️ Fault Detected!\nAsset: {st.session_state.asset_name}\nFaults: {faults}"
-            try:
-                send_alert(msg)
-            except:
-                pass
-    
-    k1.metric("Current Value", f"{current_val:.3f}", 
-              delta=f"{current_val - avg_val:.3f}" if series.size > 1 else None)
-    k2.metric("Average", f"{avg_val:.3f}")
-    k3.metric("Max", f"{max_val:.3f}")
-    k4.metric("Samples", len(series))
-    
-    if faults > 0:
-        st.error(f"🚨 {faults} anomalies detected!")
+            st.error(f"🚨 {faults} anomalies detected in window!")
     
     # Chart
     fig = go.Figure()
@@ -432,60 +419,80 @@ if series.size > 0:
         y=series,
         mode="lines",
         name=sensor_choice,
-        line=dict(color="steelblue", width=2),
+        line=dict(color="#1f77b4", width=2),
         fill='tozeroy',
-        fillcolor='rgba(70, 130, 180, 0.2)'
+        fillcolor='rgba(31, 119, 180, 0.3)'
     ))
     
     fig.add_hline(
         y=threshold,
         line_dash="dash",
         line_color="red",
-        opacity=0.7,
-        annotation_text="Threshold"
+        opacity=0.6,
+        annotation_text=f"Threshold: {threshold}"
     )
     
-    if sensor_choice == "Vibration" and faults > 0:
-        anomaly_mask = series > threshold
-        anomaly_indices = np.where(anomaly_mask)[0]
-        if len(anomaly_indices) > 0:
-            fig.add_trace(go.Scatter(
-                x=anomaly_indices,
-                y=series[anomaly_indices],
-                mode="markers",
-                marker=dict(color="red", size=10, symbol="x"),
-                name="Anomaly"
-            ))
+    # Highlight over-threshold points
+    over_threshold = series > threshold
+    if np.any(over_threshold):
+        indices = np.where(over_threshold)[0]
+        fig.add_trace(go.Scatter(
+            x=indices,
+            y=series[indices],
+            mode="markers",
+            marker=dict(color="red", size=8, symbol="x"),
+            name="Alert"
+        ))
     
     fig.update_layout(
-        title=f"{sensor_choice} — Live Stream (Updates: {st.session_state.data_counter})",
+        title=f"{sensor_choice} — Live Stream (Total: {st.session_state.data_counter} samples)",
         xaxis_title="Sample Index",
         yaxis_title="Value",
         template="plotly_white",
         height=450,
-        hovermode='x unified'
+        hovermode='x unified',
+        showlegend=True
     )
     
     st.plotly_chart(fig, use_container_width=True)
     
-    # Statistics
-    st.subheader("📊 Live Statistics")
-    stats_df = pd.DataFrame({
-        "Metric": ["Current", "Mean", "Std Dev", "Min", "Max", "Range"],
-        "Value": [
-            f"{current_val:.4f}",
-            f"{avg_val:.4f}",
-            f"{float(np.std(series)):.4f}",
-            f"{min_val:.4f}",
-            f"{max_val:.4f}",
-            f"{max_val - min_val:.4f}"
-        ]
-    })
-    st.dataframe(stats_df, use_container_width=True, hide_index=True)
+    # Statistics table
+    col_left, col_right = st.columns(2)
+    
+    with col_left:
+        st.subheader("📊 Statistics")
+        stats_df = pd.DataFrame({
+            "Metric": ["Mean", "Std Dev", "Min", "Max", "Median"],
+            "Value": [
+                f"{avg_val:.4f}",
+                f"{float(np.std(series)):.4f}",
+                f"{min_val:.4f}",
+                f"{max_val:.4f}",
+                f"{float(np.median(series)):.4f}"
+            ]
+        })
+        st.dataframe(stats_df, hide_index=True, use_container_width=True)
+    
+    with col_right:
+        st.subheader("📈 Recent Values")
+        recent = series[-10:][::-1]  # Last 10, newest first
+        recent_df = pd.DataFrame({
+            "Index": range(len(recent)),
+            "Value": [f"{v:.4f}" for v in recent]
+        })
+        st.dataframe(recent_df, hide_index=True, use_container_width=True)
     
 else:
-    st.info("⏳ Waiting for data... Start the stream or connect to MQTT")
+    st.info("⏳ Waiting for data...")
+    st.write("**To start:**")
+    if source == "Simulated Stream":
+        st.write("1. Click '▶️ Start' button above")
+    else:
+        st.write("1. Click '🔌 Connect' button above")
+        st.write("2. Make sure your data publisher is running")
+        st.write("3. Check that publisher is sending to: `broker.hivemq.com:1883`")
+    
     k1.metric("Samples", 0)
     k2.metric("Status", "No Data")
-    k3.metric("Total Updates", st.session_state.data_counter)
-    k4.metric("Threshold", threshold)
+    k3.metric("Mode", source)
+    k4.metric("Ready", "✓" if MQTT_OK else "✗")
