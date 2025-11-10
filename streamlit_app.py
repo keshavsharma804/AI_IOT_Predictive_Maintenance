@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+from src.utils.telegram_alert import send_alert
+
 
 # Optional imports (graceful fallback if not present)
 try:
