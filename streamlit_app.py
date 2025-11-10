@@ -304,15 +304,30 @@ with tab_live:
 
     # Quick scorer for live windows
     def score_live_window(arr):
-        if len(arr) < 32:
+        # Need enough samples for the LSTM windowing (very important)
+        MIN_SAMPLES = 300   # try 200 if you want faster trigger
+    
+        if arr is None or len(arr) < MIN_SAMPLES:
+            # Not enough data yet → return empty signals, no scoring
             return np.array([]), np.array([]), 0.0
+    
         df = pd.DataFrame({"vibration_rms": arr})
-        lstm = model.score_sequences(df, "vibration_rms")
-        ifs = np.zeros_like(lstm)
-        fused = fuse_scores(model, ifs, lstm)
-        thr = np.percentile(fused[:min(200, len(fused))], 99)
-        dec = (fused >= thr).astype(int)
-        return fused, dec, float(thr)
+    
+        try:
+            lstm_scores = model.score_sequences(df, "vibration_rms")
+        except Exception:
+            # If model crashes due to sequence edge conditions, skip scoring this cycle
+            return np.array([]), np.array([]), 0.0
+    
+        if_scores = np.zeros_like(lstm_scores)
+    
+        fused = fuse_scores(model, if_scores, lstm_scores)
+    
+        thr = float(np.percentile(fused[:min(2000, len(fused))], 99))
+        decisions = (fused >= thr).astype(int)
+    
+        return fused, decisions, thr
+
 
     # Push samples to buffer
     def push_sample_data(x, y, z, rpm=None, temp=None):
