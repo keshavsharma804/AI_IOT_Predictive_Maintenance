@@ -2,6 +2,8 @@
 import json, time, math, queue
 from collections import deque
 from pathlib import Path
+from datetime import datetime, timedelta
+import requests
 
 import numpy as np
 import pandas as pd
@@ -346,7 +348,7 @@ with tab_live:
             for _ in range(sim_rate):
                 j = st.session_state.sim_idx % len(xs)
                 st.session_state.message_queue.put({
-                    "x": xs[j], "y": ys[j], "z": zs[j] * 3.5   # forces anomaly
+                    "x": xs[j], "y": ys[j], "z": zs[j] * 3.5,   # forces anomaly
                     "rpm": 1500 + 10*np.sin(j/200),
                     "temp": 65 + 1.0*np.sin(j/350)
                 })
