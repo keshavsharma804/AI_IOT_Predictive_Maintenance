@@ -305,7 +305,25 @@ with tab_live:
         if c2.button("⏸️ Stop"): st.session_state.live_running = False
 
         demo = load_demo_dataframe()
-        xs, ys, zs = demo["x"].values, demo["y"].values, demo["z"].values
+
+        # CASE 1: If dataset contains x,y,z → use them
+        if {"x","y","z"}.issubset(demo.columns):
+            xs = demo["x"].values
+            ys = demo["y"].values
+            zs = demo["z"].values
+        
+        # CASE 2: If only vibration_rms exists → synthesize directional components
+        elif "vibration_rms" in demo.columns:
+            rms = demo["vibration_rms"].values
+            xs = rms * 0.97
+            ys = rms * 1.02
+            zs = rms * 1.05
+        
+        # CASE 3: No usable columns → stop safely
+        else:
+            st.error("Demo data must contain either x,y,z or vibration_rms column.")
+            st.stop()
+
 
         if st.session_state.live_running:
             if "sim_idx" not in st.session_state: st.session_state.sim_idx = 0
