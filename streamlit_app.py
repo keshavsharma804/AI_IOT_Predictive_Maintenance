@@ -405,21 +405,39 @@ with tab_live:
     processed = process_message_queue()
     series = get_series(series_choice)
 
-    if series.size:
+    # --- TELEGRAM ALERT LOGIC ---
+    alert_threshold = 0.85
+    recovery_threshold = alert_threshold * 0.8  # Avoid alert spam-switching
     
-        # --- TELEGRAM ALERT LOGIC ---
-        alert_threshold = 0.85  # adjust later based on machine behavior
-        current_rms = float(st.session_state.live_buffer[-1]) if len(st.session_state.live_buffer) else 0
+    current_rms = float(st.session_state.live_buffer[-1]) if len(st.session_state.live_buffer) else 0
     
-        now = datetime.utcnow()
-        cooldown = timedelta(seconds=30)  # avoid spam alerts
+    now = datetime.utcnow()
+    cooldown = timedelta(seconds=30)
     
-        if current_rms > alert_threshold and (now - st.session_state.last_alert_time) > cooldown:
-            send_telegram_alert(
-                f"🚨 ALERT!\nMachine: {st.session_state.asset_name}\nRMS={current_rms:.4f} crossed threshold {alert_threshold}"
-            )
-            st.session_state.last_alert_time = now
+    if "alert_mode" not in st.session_state:
+        st.session_state.alert_mode = False
     
+    # If RMS crosses threshold → Send fault alert
+    if current_rms > alert_threshold and not st.session_state.alert_mode:
+        send_telegram_alert(
+            f"🚨 *HIGH VIBRATION ALERT*\n"
+            f"Machine: {st.session_state.asset_name}\n"
+            f"RMS = {current_rms:.4f} (Threshold = {alert_threshold})\n"
+            f"⚠️ Immediate Check Recommended."
+        )
+        st.session_state.alert_mode = True
+        st.session_state.last_alert_time = now
+    
+    # If vibration returns to normal → Send recovery alert
+    elif current_rms < recovery_threshold and st.session_state.alert_mode:
+        send_telegram_alert(
+            f"✅ *Vibration Normalized*\n"
+            f"Machine: {st.session_state.asset_name}\n"
+            f"RMS back to {current_rms:.4f}"
+        )
+        st.session_state.alert_mode = False
+    
+        
         # Continue KPI + chart rendering
         k1.metric("Samples", int(series.size))
         draw_chart(series, series_choice)
