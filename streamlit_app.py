@@ -402,9 +402,10 @@ with tab_live:
 
 
     # ---- Refresh UI ----
+    # ---- Refresh UI ----
     processed = process_message_queue()
     series = get_series(series_choice)
-
+    
     # --- TELEGRAM ALERT LOGIC ---
     alert_threshold = 0.85
     recovery_threshold = alert_threshold * 0.8  # Avoid alert spam-switching
@@ -412,15 +413,16 @@ with tab_live:
     current_rms = float(st.session_state.live_buffer[-1]) if len(st.session_state.live_buffer) else 0
     
     now = datetime.utcnow()
-    cooldown = timedelta(seconds=30)
-    
+    cooldown = timedelta(seconds=30)  # optional cooldown if you want it
     if "alert_mode" not in st.session_state:
         st.session_state.alert_mode = False
+    if "last_alert_time" not in st.session_state:
+        st.session_state.last_alert_time = datetime.min
     
     # If RMS crosses threshold → Send fault alert
     if current_rms > alert_threshold and not st.session_state.alert_mode:
         send_telegram_alert(
-            f"🚨 *HIGH VIBRATION ALERT*\n"
+            f"🚨 HIGH VIBRATION ALERT\n"
             f"Machine: {st.session_state.asset_name}\n"
             f"RMS = {current_rms:.4f} (Threshold = {alert_threshold})\n"
             f"⚠️ Immediate Check Recommended."
@@ -431,22 +433,23 @@ with tab_live:
     # If vibration returns to normal → Send recovery alert
     elif current_rms < recovery_threshold and st.session_state.alert_mode:
         send_telegram_alert(
-            f"✅ *Vibration Normalized*\n"
+            f"✅ Vibration Normalized\n"
             f"Machine: {st.session_state.asset_name}\n"
             f"RMS back to {current_rms:.4f}"
         )
         st.session_state.alert_mode = False
     
-        
-        # Continue KPI + chart rendering
+    # ---- KPI + CHART (always draw when we have data) ----
+    if series.size:
         k1.metric("Samples", int(series.size))
+        # (add more KPIs if you want)
         draw_chart(series, series_choice)
     else:
         st.info("Waiting for data...")
-
-
+    
     time.sleep(update_interval/1000)
     st.rerun()
+
 
 
 # ────────────────────────────────────────────────────────────────────
