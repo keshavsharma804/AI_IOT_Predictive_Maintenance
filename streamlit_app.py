@@ -377,39 +377,72 @@ with tab_live:
     # ─────────────────────────────
     # MODE MQTT
     # ─────────────────────────────
+        # ─────────────────────────────
+    # MODE MQTT  (TCP :1883, no websockets)
+    # ─────────────────────────────
     if mode == "MQTT Live":
-        st.write("🌍 MQTT Live Telemetry Mode")
+        st.write("🌍 MQTT Live Telemetry Mode (TCP 1883)")
 
         broker = "broker.hivemq.com"
+        port = 1883
         topic = "machine/vibration/data"
 
+        # IMPORTANT: don't call Streamlit UI from callbacks except via session_state
         def on_connect(client, userdata, flags, rc, props=None):
             if rc == 0:
                 st.session_state.mqtt_connected = True
+                st.session_state.mqtt_last_err = ""
                 client.subscribe(topic)
             else:
+                st.session_state.mqtt_connected = False
                 st.session_state.mqtt_last_err = f"Connect failed (rc={rc})"
 
         def on_message(client, userdata, msg):
             try:
                 j = json.loads(msg.payload.decode("utf-8"))
-                push_sample_data(j.get("x",0), j.get("y",0), j.get("z",0),
-                                 rpm=j.get("rpm"), temp=j.get("temp"))
-            except:
+                x = float(j.get("x", 0.0))
+                y = float(j.get("y", 0.0))
+                z = float(j.get("z", 0.0))
+                rpm = j.get("rpm", None)
+                temp = j.get("temp", None)
+                push_sample_data(x, y, z, rpm=rpm, temp=temp)
+            except Exception:
+                # ignore malformed payloads
                 pass
 
-        if st.button("🔌 Connect MQTT"):
+        colA, colB = st.columns(2)
+        if colA.button("🔌 Connect (TCP 1883)", type="primary", disabled=st.session_state.mqtt_connected):
             try:
-                client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets")
-                client.ws_set_options(path="/mqtt")
+                # Plain TCP client (no websockets)
+                try:
+                    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+                except:
+                    client = mqtt.Client()
                 client.on_connect = on_connect
                 client.on_message = on_message
-                client.connect(broker, 8000, 60)
+                client.connect(broker, port, 60)
                 client.loop_start()
                 st.session_state.mqtt_client = client
+                time.sleep(0.2)
+                st.rerun()
             except Exception as e:
-                st.error(str(e))
+                st.error(f"MQTT error: {e}")
 
+        if colB.button("🔕 Disconnect", disabled=not st.session_state.mqtt_connected):
+            c = st.session_state.get("mqtt_client")
+            if c:
+                c.loop_stop()
+                c.disconnect()
+            st.session_state.mqtt_connected = False
+            st.session_state.mqtt_last_err = "Disconnected"
+            st.rerun()
+
+        if st.session_state.mqtt_connected:
+            st.success("✅ Connected (TCP 1883)")
+        if st.session_state.mqtt_last_err:
+            st.warning(st.session_state.mqtt_last_err)
+
+        # Draw latest buffer
         recent = list(st.session_state.live_buffer)[-max_points:]
         recent_rpm = list(st.session_state.live_rpm)[-max_points:]
         recent_temp = list(st.session_state.live_temp)[-max_points:]
@@ -426,9 +459,10 @@ with tab_live:
             df_plot = pd.DataFrame({"RMS": recent})
             if recent_rpm: df_plot["RPM"] = recent_rpm
             if recent_temp: df_plot["Temp"] = recent_temp
-            chart_area.line_chart(df_plot)
+            chart_area.line_chart(df_plot, use_container_width=True)
 
-        time.sleep(update_interval/1000)
+        # Keep the app ticking for live redraws
+        time.sleep(update_interval/1000.0)
         st.rerun()
 
 
