@@ -541,26 +541,45 @@ with tab_live:
 
         fig = go.Figure()
         
+        # Plot main signal (blue)
         fig.add_trace(go.Scatter(
             y=series,
             mode="lines",
             name=sensor_choice,
-            line=dict(width=2)
+            line=dict(color="steelblue", width=2)
         ))
         
-        # Threshold line
-        fig.add_hline(y=threshold, line_dash="dash", line_color="red")
+        # Add threshold reference line
+        fig.add_hline(
+            y=threshold,
+            line_dash="dash",
+            line_color="red",
+            opacity=0.7
+        )
+        
+        # If vibration — highlight anomalies
+        if sensor_choice == "Vibration" and faults > 0 and dec.size:
+            fault_idx = np.where(dec == 1)[0]
+            fault_vals = series[fault_idx]
+        
+            fig.add_trace(go.Scatter(
+                x=fault_idx,
+                y=fault_vals,
+                mode="markers",
+                marker=dict(color="red", size=8),
+                name="Fault"
+            ))
         
         fig.update_layout(
-            title=f"{sensor_choice} — last {series.size} samples",
-            xaxis_title="Time (latest → right)",
+            title=f"{sensor_choice} — Live Streaming (Zoom & Pan Enabled)",
+            xaxis_title="Time (newest → right)",
             yaxis_title="Value",
-            height=380,
             template="plotly_white",
-            showlegend=False
+            height=400,
         )
         
         st.plotly_chart(fig, use_container_width=True)
+
 
 
         # Feature tabs without retraining
