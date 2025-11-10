@@ -245,185 +245,111 @@ if source in ["Upload / CSV", "Demo (static)"]:
 # ────────────────────────────────────────────────────────────────────
 with tab_live:
     st.subheader("🟢 Live Monitoring (Real-Time)")
-
     mode = st.radio("Live Mode:", ["Simulated Stream", "MQTT Live"], horizontal=True)
 
-    # Thread-safe queue → session buffers
+    # ---- Process queued messages (MQTT / Sim Stream use same code) ----
     def process_message_queue():
         processed = 0
         q = st.session_state.message_queue
         while not q.empty():
-            try:
-                msg = q.get_nowait()
-                x = float(msg.get("x", 0.0))
-                y = float(msg.get("y", 0.0))
-                z = float(msg.get("z", 0.0))
-                rpm = float(msg.get("rpm", 1500))
-                temp = float(msg.get("temp", 65))
-                # RMS (A): sqrt((x^2+y^2+z^2)/3)
-                rms = math.sqrt((x*x + y*y + z*z)/3.0)
-                st.session_state.vibration_x.append(x)
-                st.session_state.vibration_y.append(y)
-                st.session_state.vibration_z.append(z)
-                st.session_state.live_buffer.append(rms)
-                st.session_state.live_rpm.append(rpm)
-                st.session_state.live_temp.append(temp)
-                processed += 1
-            except Exception:
-                break
+            msg = q.get_nowait()
+            x = float(msg.get("x", 0.0))
+            y = float(msg.get("y", 0.0))
+            z = float(msg.get("z", 0.0))
+            rpm = float(msg.get("rpm", 1500))
+            temp = float(msg.get("temp", 65))
+
+            rms = math.sqrt((x*x + y*y + z*z)/3.0)
+
+            st.session_state.vibration_x.append(x)
+            st.session_state.vibration_y.append(y)
+            st.session_state.vibration_z.append(z)
+            st.session_state.live_buffer.append(rms)
+            st.session_state.live_rpm.append(rpm)
+            st.session_state.live_temp.append(temp)
+            processed += 1
         return processed
 
-    # Plot controls
+    # ---- UI Controls ----
     left, right = st.columns([2,1])
     with left:
-        series_choice = st.selectbox("Series", ["RMS", "X", "Y", "Z", "RPM", "Temp"], index=0)
+        series_choice = st.selectbox("Signal", ["RMS", "X", "Y", "Z", "RPM", "Temp"])
     with right:
-        display_points = st.slider("Points", 200, 2000, max_points, 100)
+        display_points = st.slider("Display Points", 200, 2000, max_points, 100)
 
-    # Live figure placeholder
     chart_placeholder = st.empty()
     k1, k2, k3, k4 = st.columns(4)
 
     def get_series(choice):
-        if choice == "RMS": return np.array(st.session_state.live_buffer)
-        if choice == "X":   return np.array(st.session_state.vibration_x)
-        if choice == "Y":   return np.array(st.session_state.vibration_y)
-        if choice == "Z":   return np.array(st.session_state.vibration_z)
-        if choice == "RPM": return np.array(st.session_state.live_rpm)
-        if choice == "Temp":return np.array(st.session_state.live_temp)
-        return np.array([])
+        return np.array({
+            "RMS": st.session_state.live_buffer,
+            "X":   st.session_state.vibration_x,
+            "Y":   st.session_state.vibration_y,
+            "Z":   st.session_state.vibration_z,
+            "RPM": st.session_state.live_rpm,
+            "Temp":st.session_state.live_temp
+        }[choice])
 
-    def draw_chart(series: np.ndarray, title: str):
+    def draw_chart(series, title):
         series = series[-display_points:]
         fig = go.Figure()
-        fig.add_trace(go.Scatter(y=series, mode="lines", name=title))
-        fig.update_layout(
-            title=f"{title} — Live (Zoom/Pan enabled)",
-            xaxis_title="Sample",
-            yaxis_title="Value",
-            height=380,
-            template="plotly_white",
-        )
+        fig.add_trace(go.Scatter(y=series, mode="lines", name=title, line=dict(width=2)))
+        fig.update_layout(title=title + " — Live", template="plotly_white", height=380)
         chart_placeholder.plotly_chart(fig, use_container_width=True)
 
-    # Simulated stream
+    # ---- MODE A: Simulated Stream ----
     if mode == "Simulated Stream":
-        sim_rate = st.slider("Samples per tick", 1, 100, 20, 1)
-        c1, c2, c3 = st.columns(3)
+        sim_rate = st.slider("Samples per tick", 1, 50, 20)
+        c1, c2 = st.columns(2)
         if c1.button("▶️ Start"): st.session_state.live_running = True
-        if c2.button("⏸️ Pause"): st.session_state.live_running = False
-        if c3.button("🧹 Reset"):
-            st.session_state.live_running = False
-            for k in ("live_buffer","vibration_x","vibration_y","vibration_z","live_rpm","live_temp"):
-                st.session_state[k].clear()
+        if c2.button("⏸️ Stop"): st.session_state.live_running = False
 
         demo = load_demo_dataframe()
-        xs, ys, zs = None, None, None
-        if {"x","y","z"}.issubset(demo.columns):
-            xs, ys, zs = demo["x"].values, demo["y"].values, demo["z"].values
-        else:
-            rms = demo["vibration_rms"].values
-            xs, ys, zs = rms*0.97, rms*1.01, rms*1.03
+        xs, ys, zs = demo["x"].values, demo["y"].values, demo["z"].values
 
-        # Live loop
         if st.session_state.live_running:
-            if "sim_idx" not in st.session_state:
-                st.session_state.sim_idx = 0
-            i0, i1 = st.session_state.sim_idx, st.session_state.sim_idx + sim_rate
-            for i in range(i0, i1):
-                j = i % len(xs)
-                x, y, z = float(xs[j]), float(ys[j]), float(zs[j])
-                rpm  = 1500 + 25*np.sin(j/180) + np.random.randn()*5
-                temp = 65 + 1.5*np.sin(j/360) + np.random.randn()*0.4
-                msg = {"x":x, "y":y, "z":z, "rpm":rpm, "temp":temp}
-                st.session_state.message_queue.put(msg)
-            st.session_state.sim_idx = i1
+            if "sim_idx" not in st.session_state: st.session_state.sim_idx = 0
+            for _ in range(sim_rate):
+                j = st.session_state.sim_idx % len(xs)
+                st.session_state.message_queue.put({
+                    "x": xs[j], "y": ys[j], "z": zs[j],
+                    "rpm": 1500 + 10*np.sin(j/200),
+                    "temp": 65 + 1.0*np.sin(j/350)
+                })
+                st.session_state.sim_idx += 1
 
-        # Update buffers & UI every tick
-        processed = process_message_queue()
-        series = get_series(series_choice)
-        if series.size:
-            k1.metric("Samples", int(series.size))
-            if series_choice == "RMS" and series.size >= 32:
-                fused, dec, thr = score_live_window(series[-display_points:], model)
-                faults = int((dec == 1).sum()) if dec.size else 0
-                k2.metric("Fault Windows", faults)
-                k3.metric("Decision thr", f"{thr:.4f}" if thr else "—")
-            k4.metric("Update (ms)", update_interval)
-            draw_chart(series, series_choice)
-        else:
-            st.info("Waiting for data…")
-
-        time.sleep(update_interval/1000.0)
-        st.experimental_set_query_params(ts=str(time.time()))
-
-    # MQTT Live
+    # ---- MODE B: MQTT Live ----
     else:
-        st.caption("🌍 Broker: broker.hivemq.com:1883  •  Topic: `machine/vibration/data`")
+        st.caption("🌍 Broker: broker.hivemq.com  |  Topic: machine/vibration/data")
 
-        def create_mqtt_client():
-            def on_connect(client, userdata, flags, rc):
-                if rc == 0:
-                    st.session_state.mqtt_connected = True
-                    client.subscribe("machine/vibration/data", qos=0)
-                else:
-                    st.session_state.mqtt_last_err = f"Connect failed (rc={rc})"
-
-            def on_message(client, userdata, msg):
-                try:
-                    payload = json.loads(msg.payload.decode("utf-8"))
-                    st.session_state.message_queue.put(payload)
-                except Exception:
-                    pass
-
-            try:
-                client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-            except Exception:
-                client = mqtt.Client()
-            client.on_connect = on_connect
-            client.on_message = on_message
+        def create_client():
+            client = mqtt.Client()
+            client.on_message = lambda c,u,m: st.session_state.message_queue.put(json.loads(m.payload))
+            client.connect("broker.hivemq.com", 1883, 60)
+            client.subscribe("machine/vibration/data")
+            client.loop_start()
             return client
 
-        colA, colB = st.columns(2)
-        if colA.button("🔌 Connect", disabled=st.session_state.mqtt_connected):
-            try:
-                client = create_mqtt_client()
-                client.connect("broker.hivemq.com", 1883, 60)
-                client.loop_start()
-                st.session_state.mqtt_client = client
-                st.success("Connected")
-            except Exception as e:
-                st.error(f"MQTT error: {e}")
+        if not st.session_state.mqtt_connected and st.button("🔌 Connect"):
+            st.session_state.mqtt_client = create_client()
+            st.session_state.mqtt_connected = True
 
-        if colB.button("🔕 Disconnect", disabled=not st.session_state.mqtt_connected):
-            c = st.session_state.get("mqtt_client")
-            if c:
-                try:
-                    c.loop_stop(); c.disconnect()
-                except Exception:
-                    pass
-            st.session_state.mqtt_connected = False
-            st.info("Disconnected")
+        if st.session_state.mqtt_connected:
+            st.success("✅ Connected (Receiving)")
 
-        # Update buffers & UI on each refresh
-        processed = process_message_queue()
-        if processed: st.caption(f"📨 Processed {processed} messages")
+    # ---- Refresh UI ----
+    processed = process_message_queue()
+    series = get_series(series_choice)
 
-        series = get_series(series_choice)
-        if series.size:
-            k1.metric("Samples", int(series.size))
-            if series_choice == "RMS" and series.size >= 32:
-                fused, dec, thr = score_live_window(series[-display_points:], model)
-                faults = int((dec == 1).sum()) if dec.size else 0
-                k2.metric("Fault Windows", faults)
-                k3.metric("Decision thr", f"{thr:.4f}" if thr else "—")
-            k4.metric("Connected", "✅" if st.session_state.mqtt_connected else "—")
-            draw_chart(series, series_choice)
-        else:
-            st.info("Waiting for data…")
+    if series.size:
+        k1.metric("Samples", int(series.size))
+        draw_chart(series, series_choice)
+    else:
+        st.info("Waiting for data...")
 
-        time.sleep(update_interval/1000.0)
-        st.experimental_set_query_params(ts=str(time.time()))
+    time.sleep(update_interval/1000)
+    st.rerun()
+
 
 # ────────────────────────────────────────────────────────────────────
 # Admin
