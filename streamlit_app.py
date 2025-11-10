@@ -280,13 +280,7 @@ Detects **early faults** in rotating machinery from vibration signals.
             st.error(f"⚠️ {len(fault_idx)} fault windows detected.")
             st.write(f"First 50 fault windows: {fault_idx[:50].tolist()}")
 
-        # Heatmap (lightweight)
-        fig, ax = plt.subplots(figsize=(12, 2))
-        ax.imshow(fused[np.newaxis, :], aspect="auto", cmap="coolwarm")
-        ax.set_yticks([])
-        ax.set_xlabel("Window Index")
-        ax.set_title("Fault Heatmap")
-        st.pyplot(fig)
+       
 
         # Download
         res = pd.DataFrame({
@@ -543,15 +537,31 @@ with tab_live:
         k4.metric("Threshold", threshold)
     
         # Draw chart (line + horizontal threshold marker via matplotlib)
-        import matplotlib.pyplot as plt
+        import plotly.graph_objects as go
 
-        fig, ax = plt.subplots(figsize=(10, 3))
-        ax.plot(series)
-        ax.axhline(threshold, linestyle="--")
-        ax.set_title(f"{sensor_choice} — last {series.size} points")
-        ax.set_xlabel("Sample")
-        ax.set_ylabel("Value")
-        st.pyplot(fig)
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            y=series,
+            mode="lines",
+            name=sensor_choice,
+            line=dict(width=2)
+        ))
+        
+        # Threshold line
+        fig.add_hline(y=threshold, line_dash="dash", line_color="red")
+        
+        fig.update_layout(
+            title=f"{sensor_choice} — last {series.size} samples",
+            xaxis_title="Time (latest → right)",
+            yaxis_title="Value",
+            height=380,
+            template="plotly_white",
+            showlegend=False
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+
 
         # Feature tabs without retraining
         # ---- Feature Computation Block ----
