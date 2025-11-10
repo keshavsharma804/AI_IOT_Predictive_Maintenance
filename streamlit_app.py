@@ -8,6 +8,18 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
+
+# ─────────────────────────────────────────
+# Telegram Bot ALERT System
+# ─────────────────────────────────────────
+BOT_TOKEN = "8415463781:AAFK5UkXqcr8K5lWHwYLzQuQ_WqTQePDCMg"
+CHAT_ID = "5283049125"
+
+def send_telegram_alert(message: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.get(url, params={"chat_id": CHAT_ID, "text": message})
+
+
 # Optional imports
 try:
     from scipy.signal import butter, filtfilt
@@ -138,6 +150,10 @@ for k in ("live_running","mqtt_connected","mqtt_last_err"):
 
 if "asset_name" not in st.session_state:
     st.session_state.asset_name = "Motor-001"
+    
+if "last_alert_time" not in st.session_state:
+    st.session_state.last_alert_time = datetime.min
+
 
 # ────────────────────────────────────────────────────────────────────
 # Load model
@@ -330,7 +346,7 @@ with tab_live:
             for _ in range(sim_rate):
                 j = st.session_state.sim_idx % len(xs)
                 st.session_state.message_queue.put({
-                    "x": xs[j], "y": ys[j], "z": zs[j],
+                    "x": xs[j], "y": ys[j], "z": zs[j] * 3.5   # forces anomaly
                     "rpm": 1500 + 10*np.sin(j/200),
                     "temp": 65 + 1.0*np.sin(j/350)
                 })
@@ -388,10 +404,26 @@ with tab_live:
     series = get_series(series_choice)
 
     if series.size:
+    
+        # --- TELEGRAM ALERT LOGIC ---
+        alert_threshold = 0.85  # adjust later based on machine behavior
+        current_rms = float(st.session_state.live_buffer[-1]) if len(st.session_state.live_buffer) else 0
+    
+        now = datetime.utcnow()
+        cooldown = timedelta(seconds=30)  # avoid spam alerts
+    
+        if current_rms > alert_threshold and (now - st.session_state.last_alert_time) > cooldown:
+            send_telegram_alert(
+                f"🚨 ALERT!\nMachine: {st.session_state.asset_name}\nRMS={current_rms:.4f} crossed threshold {alert_threshold}"
+            )
+            st.session_state.last_alert_time = now
+    
+        # Continue KPI + chart rendering
         k1.metric("Samples", int(series.size))
         draw_chart(series, series_choice)
     else:
         st.info("Waiting for data...")
+
 
     time.sleep(update_interval/1000)
     st.rerun()
