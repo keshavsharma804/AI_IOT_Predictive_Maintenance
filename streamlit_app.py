@@ -383,36 +383,15 @@ with tab_live:
                 st.session_state.mqtt_connected = False
 
 
-    # ---- Refresh UI ----
-    processed = process_message_queue()
+    # ---- Refresh UI ----processed = process_message_queue()
     series = get_series(series_choice)
     
     if series.size:
         k1.metric("Samples", int(series.size))
-    
-        # --- ✅ ANOMALY DETECTION + TELEGRAM ALERT ---
-        if series_choice == "RMS" and model is not None and series.size >= 32:
-            fused, dec, thr = score_live_window(series[-display_points:], model)
-            faults = int((dec == 1).sum()) if dec.size else 0
-            k2.metric("Fault Windows", faults)
-            k3.metric("Decision Threshold", f"{thr:.4f}")
-    
-            # ✅ SEND ALERT IF FAULT DETECTED
-            if faults > 0:
-                from src.utils.telegram_alert import send_alert
-                alert_msg = (
-                    f"⚠️ *FAULT DETECTED*\n"
-                    f"Machine: {st.session_state.asset_name}\n"
-                    f"Fault Windows: {faults}\n"
-                    f"Recent RMS: {series[-1]:.4f}"
-                )
-                send_alert(alert_msg)
-    
-        k4.metric("Update (ms)", update_interval)
-    
         draw_chart(series, series_choice)
     else:
         st.info("Waiting for data...")
+    
 
 
 
