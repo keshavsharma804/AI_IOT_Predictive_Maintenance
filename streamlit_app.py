@@ -330,7 +330,7 @@ with tab_live:
             for _ in range(sim_rate):
                 j = st.session_state.sim_idx % len(xs)
                 st.session_state.message_queue.put({
-                    "x": xs[j], "y": ys[j], "z": zs[j] * 3,
+                    "x": xs[j], "y": ys[j], "z": zs[j],
                     "rpm": 1500 + 10*np.sin(j/200),
                     "temp": 65 + 1.0*np.sin(j/350)
                 })
@@ -383,16 +383,18 @@ with tab_live:
                 st.session_state.mqtt_connected = False
 
 
-    # ---- Refresh UI ----processed = process_message_queue()
+    # ---- Refresh UI ----
+    processed = process_message_queue()
     series = get_series(series_choice)
-    
+
     if series.size:
         k1.metric("Samples", int(series.size))
         draw_chart(series, series_choice)
     else:
         st.info("Waiting for data...")
-    
 
+    time.sleep(update_interval/1000)
+    st.rerun()
 
 
 # ────────────────────────────────────────────────────────────────────
