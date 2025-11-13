@@ -117,8 +117,10 @@ def create_mqtt_client(broker="broker.hivemq.com", port=1883, topic="machine/vib
     def on_message(client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
+            print("📩 MQTT received:", payload)
             st.session_state.message_queue.put(payload)
         except Exception:
+            print("⚠️ on_message error:", e)
             # ignore malformed payloads
             pass
 
