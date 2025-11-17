@@ -86,31 +86,6 @@ Automatic alerts when RMS exceeds safety thresholds:
 
 ⸻
 
-📂 Repository Structure
-
-project/
-│
-├── streamlit_app.py              # Main dashboard
-├── publisher.py                  # IoT data simulator (MQTT publisher)
-├── README.md                     # Documentation
-│
-└── src/
-    ├── models/
-    │   └── hybrid_ensemble.py    # LSTM AE + IF hybrid model
-    │
-    └── utils/
-        ├── telegram_alert.py     # Telegram send function
-        └── preprocessing.py      # RMS, filters, feature functions
-
-models/
-└── saved_models/
-    ├── lstm_ae.keras
-    ├── if_model.pkl
-    ├── scaler.pkl
-    └── meta.json
-
-
-⸻
 
 🧠 Machine Learning Models Used
 
@@ -279,6 +254,7 @@ This project demonstrates a full-stack AI + IoT predictive maintenance system bu
 	•	Signal processing
 	•	Visual analytics
 	•	Fault alerting
+
 
 
 
